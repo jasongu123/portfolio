@@ -1,3 +1,6 @@
+# This is the backtest of a mean reversion pairs trading strategy that buys a stock whenever it grows too slowly compared to the rest of the 
+# Magnificent 7 compared to Nvidia. And buys Nvidia whenever it grows too slowly relative to the rest of the Magnificent 7.
+
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
