@@ -243,7 +243,6 @@ for ticker in ticker_symbol:
         print(f"Exit trade at {exit_price} on {index}, PnL: {pnl}")
 print(f"Final Portfolio Value: {portfolio_size}")
 print(f"Return: {(portfolio_size/1000000 - 1)*100}%")
-print(f"Sharpe Ratio: {(returns.pct_change().mean()/returns.pct_change().std())*np.sqrt(252)}")
 
 
 
