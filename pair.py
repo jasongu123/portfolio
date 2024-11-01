@@ -105,6 +105,9 @@ returns = pd.Series()
 portfolio_size=1000000
 position = 0
 ticker_symbol.remove('NVDA')
+returns=pd.DataFrame(index=data.index)
+returns['Current Value']=0
+
 for ticker in ticker_symbol:
     for index, row in data.iterrows():
         spread=f'{ticker} Spread'
@@ -129,6 +132,14 @@ for ticker in ticker_symbol:
             pnl = (exit_price - entry_price) * shares
             portfolio_size += pnl
             print(f"Exit trade at {exit_price} on {index}, PnL: {pnl}")
+        else:
+            if position==1:
+                returns.loc[index,'Current Value']=portfolio_size+(row[ticker]-entry_price)*shares
+            if position==-1:
+                returns.loc[index,'Current Value']=portfolio_size+(row['NVDA']-entry_price)*shares
+            if position==0:
+                returns.loc[index,'Current Value']=portfolio_size
+                
     
     #returns.concat(portfolio_size)
 # for index, row in data.iterrows():
@@ -220,29 +231,36 @@ for ticker in ticker_symbol:
 #         portfolio_size += pnl
 #         print(f"Exit trade at {exit_price} on {index}, PnL: {pnl}")
 # for index, row in data.iterrows():
-    if row['META Spread'] < row['Lower Bound'] and position != 1:  # Buy stock signal
-        position = 1
-        entry_price = row['META']  # using AMD price
-        trade_size = portfolio_size * 0.1  # Using 10% position size
-        shares = trade_size / entry_price
-        print(f"Buy META at {entry_price} on {index}")
-        
-    elif row['META Spread'] > row['Upper Bound'] and position != -1:  # Buy NVDA signal
-        position = -1
-        entry_price = row['NVDA']
-        trade_size = portfolio_size * 0.1
-        shares = trade_size / entry_price
-        print(f"Buy NVDA at {entry_price} on {index}")
-    
-    # Exit when spread returns to mean
-    elif row['META Spread'] < row['Total Average'] and position != 0:  # Exit signal
-        exit_price = row['META'] if position == 1 else row['NVDA']
-        position = 0
-        pnl = (exit_price - entry_price) * shares
-        portfolio_size += pnl
-        print(f"Exit trade at {exit_price} on {index}, PnL: {pnl}")
+#     if row['META Spread'] < row['Lower Bound'] and position != 1:  # Buy stock signal
+#         position = 1
+#         entry_price = row['META']  # using AMD price
+#         trade_size = portfolio_size * 0.1  # Using 10% position size
+#         shares = trade_size / entry_price
+#         print(f"Buy META at {entry_price} on {index}") 
+#     elif row['META Spread'] > row['Upper Bound'] and position != -1:  # Buy NVDA signal
+#         position = -1
+#         entry_price = row['NVDA']
+#         trade_size = portfolio_size * 0.1
+#         shares = trade_size / entry_price
+#         print(f"Buy NVDA at {entry_price} on {index}")
+#     # Exit when spread returns to mean
+#     elif row['META Spread'] < row['Total Average'] and position != 0:  # Exit signal
+#         exit_price = row['META'] if position == 1 else row['NVDA']
+#         position = 0
+#         pnl = (exit_price - entry_price) * shares
+#         portfolio_size += pnl
+#         print(f"Exit trade at {exit_price} on {index}, PnL: {pnl}")
 print(f"Final Portfolio Value: {portfolio_size}")
 print(f"Return: {(portfolio_size/1000000 - 1)*100}%")
+print(f"Sharpe Ratio: {(returns.pct_change().mean()/returns.pct_change().std())*np.sqrt(252)}")
+
+
+
+
+
+
+
+
 
 
 
