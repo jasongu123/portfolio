@@ -1,0 +1,58 @@
+# NVIDIA Magnificent 7 Pairs Trading Strategy
+
+A simple backtesting implementation for pairs trading NVIDIA (NVDA) against other Magnificent 7 stocks using daily price changes.
+
+## Strategy Overview
+
+This strategy explores statistical arbitrage opportunities between NVIDIA and other Magnificent 7 stocks (AAPL, MSFT, AMZN, META, GOOGL, AMD) based on the premise that:
+- Tech megacaps often show correlated price movements
+- NVIDIA's unique position in AI/ML hardware can create temporary divergences in average change rates.
+- These divergences tend to mean-revert, creating trading opportunities
+
+## Performance Summary
+
+This strategy backtested this strategy from April 2023 until October 2024, 
+
+## Implementation Details
+
+The strategy:
+1. Calculates daily price changes for all M7 stocks
+2. Identifies divergences between NVDA and other M7 stocks
+3. Opens positions when divergence exceeds [your threshold]
+4. Closes positions when prices revert to mean or stop-loss triggered
+
+### Limitations
+
+This is a basic implementation that:
+- Does not account for transaction costs
+- Uses simple entry/exit rules
+- Assumes perfect execution
+- Does not implement position sizing
+
+## Usage
+
+```python
+# Sample code showing how to run the backtest
+```
+
+## Dependencies
+
+- Python 3.x
+- [List your dependencies]
+
+## Future Improvements
+
+Potential areas for enhancement:
+- Add transaction costs
+- Implement dynamic position sizing
+- Add more sophisticated entry/exit signals
+- Include volatility adjustments
+- Add visualization of trades
+
+## Contributing
+
+Feel free to fork and submit PRs to improve the implementation.
+
+## License
+
+[Your chosen license]
