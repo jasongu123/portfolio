@@ -113,7 +113,7 @@ for ticker in ticker_symbol:
         spread=f'{ticker} Spread'
         if row[spread] < row['Lower Bound'] and position != 1:  # Buy stock signal
             position = 1
-            entry_price = row[ticker]  # using AMD price
+            entry_price = row[ticker]  # using other stock price
             trade_size = portfolio_size * 0.1  # Using 10% position size
             shares = trade_size / entry_price
             print(f"Buy {ticker} at {entry_price} on {index}")
