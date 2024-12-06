@@ -11,34 +11,32 @@ This strategy explores statistical arbitrage opportunities between NVIDIA and ot
 
 ## Performance Summary
 
-This strategy backtested this strategy from April 2023 until October 2024, 
+This strategy backtested this strategy from April 2023 until October 2024, beating the Dow Jones Industrial Average by 6%.
 
 ## Implementation Details
 
 The strategy:
-1. Calculates daily price changes for all M7 stocks
-2. Identifies divergences between NVDA and other M7 stocks
-3. Opens positions when divergence exceeds [your threshold]
-4. Closes positions when prices revert to mean or stop-loss triggered
+First, it calculates the spread (other M7 stock - NVDA) between the 20-day moving average daily changes of NVDA and other 
+Magnificent 7 stocks. If the daily spread reaches below the 20-day moving average of the spread twice the 20-day standard deviation 
+of the spreads between the two stocks, it shows that the stock has been performing markedly worse than Nvidia, thereby generating
+a buy signal. Conversely, if the daily spread reaches above the 20 day moving average of the spread plus twice the 20-day standard 
+deviation of the spreads between the two stocks, it means that Nvidia has been growing slower than usual, and therefore a buy signal for Nvidia 
+is generated.
+
+When a position is held, it is sold as the spread returns to the 20-day moving average.
+
 
 ### Limitations
 
-This is a basic implementation that:
-- Does not account for transaction costs
-- Uses simple entry/exit rules
-- Assumes perfect execution
-- Does not implement position sizing
+This is a basic implementation that does not account for transaction costs and assumes perfect execution with a relatively small portfolio.
 
 ## Usage
 
-```python
-# Sample code showing how to run the backtest
-```
+python3 pair.py
 
 ## Dependencies
 
 - Python 3.x
-- [List your dependencies]
 
 ## Future Improvements
 
@@ -53,6 +51,9 @@ Potential areas for enhancement:
 
 Feel free to fork and submit PRs to improve the implementation.
 
-## License
 
-[Your chosen license]
+Copyright (c) 2024 github.com/jasongu123. All rights reserved.
+
+This code is provided for viewing/educational purposes only. No part of this code
+mag be used, copied or distributed without proper permission.
+
