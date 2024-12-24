@@ -1,0 +1,11 @@
+This project has attempted to create a dual option strategy value calculator that also presents the best and worst case scenarios of popular dual European option strategies. 
+It has attempted to cover call spreads, put spreads, straddles and strangles. The core of this project is based on an option value calculator in Chapter 3 of “Introduction 
+to C++ for Financial Engineers” by Daniel J. Duffy.
+
+The input is provided through the command line. The input parameters are: the stock price, the strike, the volatility, the years to expiration, the stocks dividend yield, 
+and the current risk-free interest rate. It is repeated twice, once for each option. First, the algorithm calculates option prices using the Black-Scholes-Merton method 
+to compose the price value for the dual option strategy. 
+
+Then, for option spreads, in a separate function, the standard deviation is taken according to the implied volatility of the options, and the best and worst case scenario is 
+taken: if the stock goes down by more than two standard deviations or up, depending on the strategy being assessed. There is a different framework for straddles and strangles, 
+which profit from strong moves in the stock regardless of direction. Instead, the probability for profit is calculated by calculating the amount of standard deviations that the stock would have to move on both sides for the company to profit, then add up the values on both tail ends.
