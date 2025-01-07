@@ -11,7 +11,8 @@ This strategy explores statistical arbitrage opportunities between NVIDIA and ot
 
 ## Performance Summary
 
-This strategy backtested this strategy from April 2023 until October 2024, beating the Dow Jones Industrial Average by 6%.
+This strategy backtested this strategy from January 2019 to January 2025. During this period, it acheived a total return of 156.55%, beating the S&P 500's return of 134.26%
+over the same time period. This strategy ensured a stable portfolio through the COVID crisis while capturing to the best of its ability the rapid growth in tech stocks since May 2023.
 
 ## Implementation Details
 
