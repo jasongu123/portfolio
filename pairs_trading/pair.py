@@ -169,8 +169,17 @@ for index, row in data.iterrows():
     
 print(f"Final Portfolio Value: {portfolio_size}")
 print(f"Return: {(portfolio_size/1000000 - 1)*100}%")
+annualreturn = ((portfolio_size/1000000) ** (252/len(returns)) - 1)
+# Calculate annualized volatility
+annualvol = returns['Current Value'].pct_change().std() * np.sqrt(252)
+
+# Calculate Sharpe ratio
+print(f"Annual Return: {annualreturn*100}%")
+
+# Calculate Sharpe ratio
+sharpe = (annualreturn - 0.04) / annualvol
 # print(f"Sharpe Ratio: {(returns.pct_change().mean()/returns.pct_change().std())*np.sqrt(252)}")
-print(f"Sharpe Ratio: {((portfolio_size/1000000 - 1-0.04)/(len(avg)/252)/(returns.pct_change().std()*np.sqrt(252)))}")
+print(f"Sharpe Ratio: {sharpe}")
 
 print(((portfolio_size/1000000 - 1)-0.04)/(len(avg)/252))
 print(returns.pct_change().std())
@@ -326,8 +335,11 @@ excess_return = strategy_return - spy_return
 
 # Calculate Sharpe Ratios (assuming risk-free rate of 4%)
 rf_rate = 0.04
-strategy_sharpe = ((strategy_return/100 - rf_rate) / (returns['Current Value'].pct_change().std() * np.sqrt(252)))
-spy_sharpe = ((spy_return/100 - rf_rate) / (spy_portfolio.pct_change().std() * np.sqrt(252)))
+strategy_sharpe = (annualreturn - 0.04) / annualvol
+spyreturn = ((spy_portfolio.iloc[-1]/1000000) ** (252/len(returns)) - 1)
+# Calculate annualized volatility
+spyvol = spy_portfolio.pct_change().std() * np.sqrt(252) 
+spy_sharpe = (spyreturn - rf_rate) / spyvol
 
 # Add performance statistics text box
 stats_text = (
