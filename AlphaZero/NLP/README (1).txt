@@ -1,0 +1,1 @@
+You will be prompted to enter the dices, sides, lower target, upper target, number of games and the hyperparameter M, in that order.

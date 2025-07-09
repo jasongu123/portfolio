@@ -1,0 +1,1 @@
+Enter the path of the corpus and the size of the training corpus as prompted.
