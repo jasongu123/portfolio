@@ -64,7 +64,7 @@ DEFAULT_CLIENT_ID = 1
 #         1, 1, False, []
 #     )
     
-#     # Collect the data
+#     
 #     bars = []
 #     timeout = time.time() + 10  # 10 second timeout
 #     while time.time() < timeout:
@@ -105,53 +105,49 @@ class ExchangeCache:
             print(f"Error saving exchange cache: {e}")
     
     def get_exchange(self, symbol):
-        """Get exchange info for symbol (from cache or IBKR)"""
         with self.cache_lock:
             # Check cache first
             if symbol in self.cache:
                 return self.cache[symbol]['primary'], self.cache[symbol]['exchange']
             
-            # If not in cache, query IBKR
+
             primary, exchange = get_correct_exchange(symbol, self.client)
             
-            # Update cache
+
             self.cache[symbol] = {
                 'primary': primary,
                 'exchange': exchange,
                 'last_updated': time.time()
             }
             
-            # Save cache periodically (could be optimized to save less frequently)
             self.save_cache()
             
             return primary, exchange
 
 class TradingSystem:
-    def __init__(self, existing_client):  # Accept the existing client as a parameter
+    def __init__(self, existing_client):  
         """
         Initialize the trading system using an existing client connection
         rather than creating a new one
         """
-        self.client = existing_client  # Use the existing client
+        self.client = existing_client  
         self.exchange_cache = ExchangeCache(existing_client)
-        print(f"DEBUG: TradingSystem created exchange_cache: {self.exchange_cache}")  # Add this line
+        print(f"DEBUG: TradingSystem created exchange_cache: {self.exchange_cache}")  
         print(f"DEBUG: exchange_cache type: {type(self.exchange_cache)}")
         self.db_conn = self.init_database()
         self.db_lock = threading.Lock()
         self.trading_day = None
         self.risk_manager = RiskManager(existing_client, self.exchange_cache)
         print(f"DEBUG: Passing exchange_cache to RiskManager: {self.exchange_cache}")
-        self.client.add_callback_handler(self.risk_manager)  # Add risk manager as callback handler
+        self.client.add_callback_handler(self.risk_manager) 
         self.trading_strategy = TradingStrategy(self.risk_manager, existing_client)
         self.is_market_open = False
         self.monitored_symbols = ['AAPL', 'MSFT', 'GOOGL', 'AMZN']
         
     def init_database(self):
-        """Creates or connects to a database to persist trading data"""
         conn = sqlite3.connect('trading_system.db', check_same_thread=False)
         cursor = conn.cursor()
         
-        # Create tables for tracking trades and daily PnL
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS daily_pnl (
                 date TEXT PRIMARY KEY,
@@ -175,14 +171,12 @@ class TradingSystem:
     def check_trading_signals(self):
         for symbol in self.monitored_symbols:
             try:
-            # Get recent bars for the symbol
                 df = get_recent_bars(symbol, '1 min', '2 D', for_calculation=True, client_instance=self.client, exchange_cache=self.exchange_cache)
             
                 if df.empty:
                     print(f"No data available for {symbol}")
                     continue
                 
-            # Generate signal
                 signal = self.trading_strategy.generate_signal(symbol, df)
             
             # Execute trade if signal is generated
@@ -197,17 +191,15 @@ class TradingSystem:
         while True:
             current_time = datetime.datetime.now(pytz.timezone('US/Eastern'))
             
-            # Check if it's a trading day
             if self.is_trading_day(current_time):
                 if self.trading_day != current_time.date():
                     self.start_trading_day(current_time.date())
                 
                 if self.is_market_hours(current_time):
                     self.is_market_open = True
-                    self.update_positions()  # Update position values
+                    self.update_positions()  
                     
-                    # Check for trading signals every 5 minutes
-                    if current_time.minute % 1 == 0:  # At minutes 0, 5, 10, 15, etc.
+                    if current_time.minute % 1 == 0:  
                         self.check_trading_signals()
                         
                 else:
@@ -218,19 +210,15 @@ class TradingSystem:
             time.sleep(60)  # Update every minute
 
     def update_positions(self):
-        """Updates position values and PnL from IBKR"""
-        # Request account updates from IBKR
         self.client.reqAccountUpdates(True, "")
         
     def updateAccountValue(self, key, value, currency, accountName):
-        """Callback from IBKR with account information"""
         if key == "RealizedPnL":
             self.update_realized_pnl(float(value))
         elif key == "UnrealizedPnL":
             self.update_unrealized_pnl(float(value))
 
     def update_realized_pnl(self, pnl):
-        """Updates realized PnL in database"""
         with self.db_lock:
             cursor = self.db_conn.cursor()
             cursor.execute('''
@@ -241,10 +229,8 @@ class TradingSystem:
             self.db_conn.commit()
 
     def start_trading_day(self, date):
-        """Initializes a new trading day"""
         self.trading_day = date
         
-        # Create new daily PnL record
         with self.db_lock:
             cursor = self.db_conn.cursor()
             cursor.execute('''
@@ -253,44 +239,32 @@ class TradingSystem:
             ''', (date.strftime('%Y-%m-%d'),))
             self.db_conn.commit()
         
-        # Load previous positions from database
         self.update_positions()
 
     def is_trading_day(self, dt):
-        """Determines if this is a trading day (excluding weekends and holidays)"""
-        if dt.weekday() in (5, 6):  # Weekend
+        if dt.weekday() in (5, 6): 
             return False
             
-        # You would add holiday checking here
         return True
 
     def is_market_hours(self, dt):
-        """Checks if we're in regular market hours"""
         market_open = dt.replace(hour=9, minute=30, second=0)
         market_close = dt.replace(hour=16, minute=0, second=0)
         return market_open <= dt <= market_close
     
 def get_correct_exchange(symbol, client_instance):
-    """
-    Determines the correct primary exchange for a stock symbol by querying IBKR.
-    Returns a tuple of (primaryExchange, exchange) strings.
-    """
-    # Create a basic contract with minimal info
     contract = Contract()
     contract.symbol = symbol
     contract.secType = 'STK'
     contract.currency = 'USD'
-    contract.exchange = 'SMART'  # Start with SMART routing
+    contract.exchange = 'SMART' 
     
-    # Create a synchronized request mechanism
     exchange_info = {'primary': None, 'valid_exchanges': None}
     request_complete = threading.Event()
     
-    # Save original callbacks
     original_contract_details = client_instance.contractDetails
     original_contract_details_end = client_instance.contractDetailsEnd
     
-    # Create temporary callbacks
     def temp_contract_details(reqId, details):
         exchange_info['primary'] = details.contract.primaryExchange
         exchange_info['valid_exchanges'] = details.validExchanges
@@ -300,18 +274,15 @@ def get_correct_exchange(symbol, client_instance):
         request_complete.set()
     
     try:
-        # Set our temporary callbacks
         client_instance.contractDetails = temp_contract_details
         client_instance.contractDetailsEnd = temp_contract_details_end
         
-        # Make the request
         req_id = int(time.time() * 1000) % 10000
         client_instance.reqContractDetails(req_id, contract)
         
-        # Wait for completion (with timeout)
         if not request_complete.wait(timeout=10):
             print(f"Timeout waiting for contract details for {symbol}")
-            return 'SMART', 'SMART'  # Default fallback
+            return 'SMART', 'SMART'  
         
         # Return the exchange information
         primary = exchange_info['primary'] if exchange_info['primary'] else 'SMART'
