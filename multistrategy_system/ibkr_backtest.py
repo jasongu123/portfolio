@@ -26,13 +26,27 @@ import time as time_module
 import warnings
 warnings.filterwarnings('ignore')
 
-# ML imports for Random Forest
+# ML imports for Random Forest / LightGBM / XGBoost
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+try:
+    from lightgbm import LGBMClassifier
+    HAS_LIGHTGBM = True
+except ImportError:
+    LGBMClassifier = None
+    HAS_LIGHTGBM = False
+try:
+    from xgboost import XGBClassifier
+    HAS_XGBOOST = True
+except ImportError:
+    XGBClassifier = None
+    HAS_XGBOOST = False
 import joblib
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+from trading_costs import CostModelConfig, estimate_execution_cost
 
 # Market hours
 MARKET_OPEN = time(9, 30)
@@ -180,7 +194,8 @@ def extract_ibkr_data(
     symbols: list,
     years_back: int = 6,
     timeframe: str = '1 min',
-    save_dir: str = None
+    save_dir: str = None,
+    skip_recent_months: int = 0
 ):
     """
     Extract historical data from IBKR in chunks going backwards.
@@ -248,8 +263,10 @@ def extract_ibkr_data(
 
             failed_chunks = []  # Track failed chunks for retry
 
-            # Fetch in chunks going backwards
-            for i in range(total_chunks):
+            # Fetch in chunks going backwards. skip_recent_months skips the most-recent
+            # chunks you ALREADY have, so a targeted pull EXTENDS history instead of
+            # re-fetching it (for 1-min, chunks == months).
+            for i in range(skip_recent_months, total_chunks):
                 # Calculate end_datetime for this chunk
                 if i == 0:
                     end_dt = ""  # Now
@@ -324,11 +341,17 @@ def extract_ibkr_data(
             # Combine all chunks
             if all_intraday:
                 df_intraday = pd.concat(all_intraday, ignore_index=True)
-                df_intraday = df_intraday.drop_duplicates(subset=['date']).sort_values('date')
 
                 # Use timeframe in filename (e.g., SPY_1m.csv, SPY_15m.csv)
                 tf_suffix = timeframe.replace(' ', '').replace('mins', 'm').replace('min', 'm')
                 intraday_file = os.path.join(save_dir, f'{symbol}_{tf_suffix}.csv')
+                # MERGE with any existing file so a targeted (skip_recent_months) pull
+                # EXTENDS your history instead of overwriting the data you already have.
+                # keep='last' -> a re-fetched bar refreshes the old one.
+                if os.path.exists(intraday_file):
+                    df_existing = pd.read_csv(intraday_file)
+                    df_intraday = pd.concat([df_existing, df_intraday], ignore_index=True)
+                df_intraday = df_intraday.drop_duplicates(subset=['date'], keep='last').sort_values('date')
                 df_intraday.to_csv(intraday_file, index=False)
                 print(f"\n  TOTAL: {len(df_intraday)} intraday bars saved")
                 print(f"  Range: {df_intraday['date'].min()} to {df_intraday['date'].max()}")
@@ -634,7 +657,7 @@ def check_data_coverage(symbols: list = None, save_dir: str = None, auto_extract
     if save_dir is None:
         save_dir = DATA_DIR
     if symbols is None:
-        symbols = ['NVDA', 'JPM', 'GOOG', 'WMT', 'QQQ', 'SPY']
+        symbols = ['SPY', 'QQQ', 'IWM','NVDA', 'JPM', 'GOOG', 'WMT', 'AAPL', 'MSFT', 'META', 'UNH', 'XOM']  # ETFs + stocks
 
     print("Data coverage by year:")
     print("=" * 60)
@@ -763,6 +786,82 @@ def extract_vix_data(years_back: int = 6, save_dir: str = None):
 
     client.disconnect()
     print("VIX extraction complete!")
+
+
+# Indices/ETFs we know how to extract — extend the list to add more.
+# Note: UUP (dollar ETF) replaces DXY because DXY requires an ICE subscription
+# most retail accounts don't have. UUP is a free stock with tight tracking.
+# Matching configuration lives in ibkr2.py:get_recent_bars (INDEX_EXCHANGES /
+# STOCK_PRIMARY_EXCHANGES) and EnhancedTradingStrategy.historical_index_caches.
+DEFAULT_AUX_INDICES = ['VIX9D', 'VIX3M', 'VVIX', 'UUP', 'TNX', 'RSP']
+
+
+def extract_index_data(symbols=None, years_back: int = 6, save_dir: str = None):
+    """
+    Extract historical daily bars for multiple CBOE/NYBOT indices used as
+    Phase-B ML features (VIX term structure + cross-asset).
+
+    Each symbol writes to {save_dir}/{SYMBOL}_daily.csv with the same schema
+    as VIX_daily.csv (date, open, high, low, close, volume).
+
+    Usage:
+        from ibkr_backtest import extract_index_data
+        extract_index_data()                              # default 5 indices, 6y back
+        extract_index_data(['VIX9D','VIX3M'], years_back=5)
+    """
+    import time as time_mod
+
+    if symbols is None:
+        symbols = DEFAULT_AUX_INDICES
+
+    try:
+        from ibkr2 import get_recent_bars, PTLClient, TRADING_PORT
+    except Exception as e:
+        print(f"Error importing from ibkr2.py: {e}")
+        return
+
+    print(f"Connecting to TWS for {len(symbols)} index extractions...")
+    client = PTLClient('127.0.0.1', TRADING_PORT, 203)
+    time_mod.sleep(2)
+
+    if save_dir is None:
+        save_dir = DATA_DIR
+    os.makedirs(save_dir, exist_ok=True)
+
+    for sym in symbols:
+        print(f"\n{'='*50}\nFetching {sym} ({years_back} years)\n{'='*50}")
+        all_chunks = []
+
+        for i in range(years_back):
+            end_dt = "" if i == 0 else (datetime.now() - timedelta(days=i * 365)).strftime("%Y%m%d %H:%M:%S")
+            print(f"  Year {i+1}/{years_back}...")
+
+            df_chunk = get_recent_bars(
+                sym, '1 day', '1 Y',
+                for_calculation=True,
+                client_instance=client,
+                end_datetime=end_dt,
+            )
+
+            if not df_chunk.empty:
+                print(f"    Got {len(df_chunk)} bars")
+                all_chunks.append(df_chunk)
+            else:
+                print(f"    No data returned")
+            time_mod.sleep(3)
+
+        if all_chunks:
+            df_all = pd.concat(all_chunks, ignore_index=True)
+            df_all = df_all.drop_duplicates(subset=['date']).sort_values('date')
+            out = os.path.join(save_dir, f'{sym}_daily.csv')
+            df_all.to_csv(out, index=False)
+            print(f"  Saved {len(df_all)} bars → {out}")
+            print(f"  Range: {df_all['date'].min()} to {df_all['date'].max()}")
+        else:
+            print(f"  WARNING: No data collected for {sym}")
+
+    client.disconnect()
+    print("\nIndex extraction complete!")
 
 
 def load_csv_data(symbols: list, data_dir: str = None) -> dict:
@@ -902,7 +1001,7 @@ class StrategyBacktester:
         # Strategy parameters (matching Zarattini paper)
         lag: int = 14,
         target_vol: float = 0.02,  # Paper: 2% daily target volatility
-        volatility_multiplier: float = 1.0,
+        volatility_multiplier: float = 1.5,  # Paper §4.4 Fig 9: peak risk-adjusted Sharpe at VM≈1.5
         p_terms: int = 1,
         o_terms: int = 0,
         q_terms: int = 1,
@@ -914,8 +1013,27 @@ class StrategyBacktester:
         # RF parameters
         use_rf: bool = True,
         rf_min_samples: int = 50,
-        rf_confidence_threshold: float = 0.65,
+        rf_confidence_threshold: float = 0.55,
         rf_walk_forward_window: int = 200,  # Rolling window for walk-forward training
+        # LightGBM parameters
+        use_lgbm: bool = False,
+        lgbm_min_samples: int = 50,
+        lgbm_confidence_threshold: float = 0.55,
+        lgbm_walk_forward_window: int = 200,
+        # XGBoost parameters
+        use_xgb: bool = False,
+        xgb_min_samples: int = 50,
+        xgb_confidence_threshold: float = 0.55,
+        xgb_walk_forward_window: int = 200,
+        # ML gate selection
+        ml_mode: str | None = None,  # 'none', 'rf', 'lgbm', 'xgb', 'ensemble'
+        ensemble_method: str = 'prob_avg',  # 'prob_avg' or 'agreement'
+        ensemble_confidence_threshold: float = 0.55,
+        ensemble_rf_weight: float = 0.5,
+        ensemble_lgbm_weight: float = 0.5,
+        ensemble_xgb_weight: float = 0.0,
+        ml_profit_target_pct: float = 0.001,
+        ml_train_on_all_candidates: bool = True,
         # VIX filter: only trade ETFs when VIX is above minimum (paper says higher VIX = better)
         # NOTE: This filter only applies to ETFs. Stocks trade regardless of VIX level.
         vix_min: float = 17,  # Minimum VIX to trade ETFs
@@ -989,16 +1107,108 @@ class StrategyBacktester:
         # Costs
         self.commission_per_share = commission_per_share
         self.slippage_bps = slippage_bps
+        # Intraday data does not include reliable bid/ask quotes, so the legacy
+        # slippage assumption is the shared model's fallback execution cost.
+        # Keep extra_slippage_bps at zero to avoid charging the same assumption
+        # twice.  All backtest order paths use the same $0.35 IBKR minimum.
+        self.cost_model_config = CostModelConfig(
+            commission_per_share=commission_per_share,
+            min_commission=0.35,
+            fallback_execution_bps=slippage_bps,
+            extra_slippage_bps=0.0,
+        )
+        self.execution_cost_totals = self._empty_execution_cost_totals()
 
-        # RF parameters
-        self.use_rf = use_rf
+        # ML parameters
         self.rf_min_samples = rf_min_samples
         self.rf_confidence_threshold = rf_confidence_threshold
         self.rf_walk_forward_window = rf_walk_forward_window
+        self.lgbm_min_samples = lgbm_min_samples
+        self.lgbm_confidence_threshold = lgbm_confidence_threshold
+        self.lgbm_walk_forward_window = lgbm_walk_forward_window
+        self.xgb_min_samples = xgb_min_samples
+        self.xgb_confidence_threshold = xgb_confidence_threshold
+        self.xgb_walk_forward_window = xgb_walk_forward_window
+        requested_ml_mode = (ml_mode.lower() if isinstance(ml_mode, str) else None)
+        if requested_ml_mode not in {None, 'none', 'rf', 'lgbm', 'xgb', 'ensemble'}:
+            raise ValueError(f"Unsupported ml_mode={ml_mode!r}. Use 'none', 'rf', 'lgbm', 'xgb', or 'ensemble'.")
+
+        if requested_ml_mode is None:
+            if use_lgbm:
+                requested_ml_mode = 'lgbm'
+            elif use_xgb:
+                requested_ml_mode = 'xgb'
+            elif use_rf:
+                requested_ml_mode = 'rf'
+            else:
+                requested_ml_mode = 'none'
+
+        if requested_ml_mode in {'lgbm', 'ensemble'} and not HAS_LIGHTGBM:
+            fallback_mode = 'rf' if (use_rf or requested_ml_mode == 'ensemble') else 'none'
+            print(
+                f"Warning: LightGBM requested for ml_mode='{requested_ml_mode}' but package is unavailable. "
+                f"Falling back to '{fallback_mode}'."
+            )
+            requested_ml_mode = fallback_mode
+
+        if (
+            requested_ml_mode == 'xgb' or
+            (requested_ml_mode == 'ensemble' and ensemble_xgb_weight > 0)
+        ) and not HAS_XGBOOST:
+            fallback_mode = 'rf' if (use_rf or requested_ml_mode == 'ensemble') else 'none'
+            print(
+                f"Warning: XGBoost requested for ml_mode='{requested_ml_mode}' but package is unavailable. "
+                f"Falling back to '{fallback_mode}'."
+            )
+            requested_ml_mode = fallback_mode
+
+        self.ml_mode = requested_ml_mode
+        self.use_rf = self.ml_mode in {'rf', 'ensemble'}
+        self.use_lgbm = self.ml_mode in {'lgbm', 'ensemble'}
+        self.use_xgb = self.ml_mode == 'xgb' or (
+            self.ml_mode == 'ensemble' and ensemble_xgb_weight > 0
+        )
+        self.ensemble_method = ensemble_method.lower()
+        if self.ensemble_method not in {'prob_avg', 'agreement'}:
+            raise ValueError(
+                f"Unsupported ensemble_method={ensemble_method!r}. Use 'prob_avg' or 'agreement'."
+            )
+        self.ensemble_confidence_threshold = ensemble_confidence_threshold
+        self.ensemble_rf_weight = ensemble_rf_weight
+        self.ensemble_lgbm_weight = ensemble_lgbm_weight
+        self.ensemble_xgb_weight = ensemble_xgb_weight
+        self.ml_profit_target_pct = ml_profit_target_pct
+        self.ml_train_on_all_candidates = ml_train_on_all_candidates
+
+        # VALIDATED 33-feature set — backtested at +10.27% / Sharpe 1.16 (2025).
+        # MUST stay identical (names + order) to ibkr2.py rf_feature_names.
+        # The 44-feature superset (adding Phase-C levels, breadth_rs, volume_ratio,
+        # hour_of_day, sma_20_vs_price) OVERFIT to +6.67% / 0.75 and was reverted.
+        # Those columns are still computed in extract_rf_features (harmless) so
+        # each can be re-validated individually before any re-add.
+        self.ml_feature_names = [
+            'trade_direction', 'is_etf',
+            'price_vs_open', 'price_vs_vwap', 'realized_vol', 'gap_size',
+            'vix_level', 'minutes_from_open', 'day_of_week', 'first_half_return',
+            'sigma_at_entry', 'move_over_sigma', 'gap_over_sigma',
+            'distance_to_upper_bound', 'distance_to_lower_bound',
+            'relative_volume', 'return_5m', 'return_15m',
+            'realized_vol_5m', 'realized_vol_15m',
+            'opening_range_width', 'opening_range_position', 'stock_vol_rank',
+            # Phase A calendar
+            'is_opex_day', 'is_day_after_opex', 'days_to_fomc', 'days_to_cpi', 'days_to_nfp',
+            # Phase B VIX term structure & cross-asset
+            'vix_term_slope', 'vix3m_ratio', 'vvix_level', 'dxy_level', 'tnx_level',
+        ]
         self.rf_model = None
         self.rf_scaler = StandardScaler()
         self.rf_training_data = []
         self.rf_val_scores = []  # Track walk-forward validation scores
+        self.lgbm_model = None
+        self.lgbm_val_scores = []
+        self.xgb_model = None
+        self.xgb_val_scores = []
+        self.relative_volume_cache = {}
 
         # VIX filter
         self.vix_min = vix_min
@@ -1140,6 +1350,411 @@ class StrategyBacktester:
         self.data = {}
         self.results = None
         self.backtest_daily_returns = None
+        self.ml_gate_stats = self._create_ml_gate_stats()
+
+    def _ordered_feature_values(self, features: dict) -> list:
+        """Convert feature dict to a stable ordered vector."""
+        return [features.get(name, 0.0) for name in self.ml_feature_names]
+
+    def _create_ml_gate_stats(self) -> dict:
+        """Initialize per-run ML gate diagnostics."""
+        return {
+            'base_candidates': 0,
+            'long_candidates': 0,
+            'short_candidates': 0,
+            'warmup_passthrough': 0,
+            'feature_passthrough': 0,
+            'gated_candidates': 0,
+            'active_approved': 0,
+            'active_blocked': 0,
+            'active_confidence_sum': 0.0,
+            'rf_shadow_evals': 0,
+            'rf_shadow_approved': 0,
+            'rf_shadow_confidence_sum': 0.0,
+            'lgbm_shadow_evals': 0,
+            'lgbm_shadow_approved': 0,
+            'lgbm_shadow_confidence_sum': 0.0,
+            'xgb_shadow_evals': 0,
+            'xgb_shadow_approved': 0,
+            'xgb_shadow_confidence_sum': 0.0,
+            'dual_model_evals': 0,
+            'dual_model_signal_disagreements': 0,
+            'dual_model_approval_disagreements': 0,
+        }
+
+    def _record_shadow_model_decisions(self, features: dict) -> dict:
+        """Evaluate any available trained models on the same feature snapshot for diagnostics."""
+        decisions = {}
+
+        if features is None:
+            return decisions
+
+        if self.rf_model is not None:
+            rf_signal, rf_confidence = self.get_rf_signal(features)
+            if rf_signal is not None:
+                rf_approved = rf_signal == 'TRADE' and rf_confidence >= self.rf_confidence_threshold
+                self.ml_gate_stats['rf_shadow_evals'] += 1
+                self.ml_gate_stats['rf_shadow_confidence_sum'] += rf_confidence
+                if rf_approved:
+                    self.ml_gate_stats['rf_shadow_approved'] += 1
+                decisions['rf'] = {
+                    'signal': rf_signal,
+                    'confidence': rf_confidence,
+                    'approved': rf_approved,
+                }
+
+        if self.lgbm_model is not None:
+            lgbm_signal, lgbm_confidence = self.get_lgbm_signal(features)
+            if lgbm_signal is not None:
+                lgbm_approved = lgbm_signal == 'TRADE' and lgbm_confidence >= self.lgbm_confidence_threshold
+                self.ml_gate_stats['lgbm_shadow_evals'] += 1
+                self.ml_gate_stats['lgbm_shadow_confidence_sum'] += lgbm_confidence
+                if lgbm_approved:
+                    self.ml_gate_stats['lgbm_shadow_approved'] += 1
+                decisions['lgbm'] = {
+                    'signal': lgbm_signal,
+                    'confidence': lgbm_confidence,
+                    'approved': lgbm_approved,
+                }
+
+        if self.xgb_model is not None:
+            xgb_signal, xgb_confidence = self.get_xgb_signal(features)
+            if xgb_signal is not None:
+                xgb_approved = xgb_signal == 'TRADE' and xgb_confidence >= self.xgb_confidence_threshold
+                self.ml_gate_stats['xgb_shadow_evals'] += 1
+                self.ml_gate_stats['xgb_shadow_confidence_sum'] += xgb_confidence
+                if xgb_approved:
+                    self.ml_gate_stats['xgb_shadow_approved'] += 1
+                decisions['xgb'] = {
+                    'signal': xgb_signal,
+                    'confidence': xgb_confidence,
+                    'approved': xgb_approved,
+                }
+
+        if 'rf' in decisions and 'lgbm' in decisions:
+            self.ml_gate_stats['dual_model_evals'] += 1
+            if decisions['rf']['signal'] != decisions['lgbm']['signal']:
+                self.ml_gate_stats['dual_model_signal_disagreements'] += 1
+            if decisions['rf']['approved'] != decisions['lgbm']['approved']:
+                self.ml_gate_stats['dual_model_approval_disagreements'] += 1
+
+        return decisions
+
+    def get_ml_gate_diagnostics(self) -> dict:
+        """Return ML gate diagnostics with derived rates for reporting."""
+        diagnostics = dict(self.ml_gate_stats)
+
+        base_candidates = diagnostics.get('base_candidates', 0)
+        gated_candidates = diagnostics.get('gated_candidates', 0)
+        dual_model_evals = diagnostics.get('dual_model_evals', 0)
+        rf_shadow_evals = diagnostics.get('rf_shadow_evals', 0)
+        lgbm_shadow_evals = diagnostics.get('lgbm_shadow_evals', 0)
+        xgb_shadow_evals = diagnostics.get('xgb_shadow_evals', 0)
+
+        diagnostics['gate_ready_rate'] = (
+            gated_candidates / base_candidates if base_candidates > 0 else 0.0
+        )
+        diagnostics['active_approval_rate'] = (
+            diagnostics.get('active_approved', 0) / gated_candidates if gated_candidates > 0 else 0.0
+        )
+        diagnostics['active_avg_confidence'] = (
+            diagnostics.get('active_confidence_sum', 0.0) / gated_candidates if gated_candidates > 0 else 0.0
+        )
+        diagnostics['rf_shadow_approval_rate'] = (
+            diagnostics.get('rf_shadow_approved', 0) / rf_shadow_evals if rf_shadow_evals > 0 else 0.0
+        )
+        diagnostics['rf_shadow_avg_confidence'] = (
+            diagnostics.get('rf_shadow_confidence_sum', 0.0) / rf_shadow_evals if rf_shadow_evals > 0 else 0.0
+        )
+        diagnostics['lgbm_shadow_approval_rate'] = (
+            diagnostics.get('lgbm_shadow_approved', 0) / lgbm_shadow_evals if lgbm_shadow_evals > 0 else 0.0
+        )
+        diagnostics['lgbm_shadow_avg_confidence'] = (
+            diagnostics.get('lgbm_shadow_confidence_sum', 0.0) / lgbm_shadow_evals if lgbm_shadow_evals > 0 else 0.0
+        )
+        diagnostics['xgb_shadow_approval_rate'] = (
+            diagnostics.get('xgb_shadow_approved', 0) / xgb_shadow_evals if xgb_shadow_evals > 0 else 0.0
+        )
+        diagnostics['xgb_shadow_avg_confidence'] = (
+            diagnostics.get('xgb_shadow_confidence_sum', 0.0) / xgb_shadow_evals if xgb_shadow_evals > 0 else 0.0
+        )
+        diagnostics['dual_model_signal_disagreement_rate'] = (
+            diagnostics.get('dual_model_signal_disagreements', 0) / dual_model_evals if dual_model_evals > 0 else 0.0
+        )
+        diagnostics['dual_model_approval_disagreement_rate'] = (
+            diagnostics.get('dual_model_approval_disagreements', 0) / dual_model_evals if dual_model_evals > 0 else 0.0
+        )
+
+        return diagnostics
+
+    def _safe_std(self, values: pd.Series) -> float:
+        """Return a finite standard deviation for a pandas Series."""
+        if values is None or len(values) < 2:
+            return 0.0
+
+        std_value = values.std()
+        if pd.isna(std_value):
+            return 0.0
+        return float(std_value)
+
+    def _get_relative_volume(
+        self,
+        symbol: str,
+        trade_date,
+        day_bars: pd.DataFrame,
+        bar_idx: int,
+        lookback_days: int = 10
+    ) -> float:
+        """Cumulative volume vs average cumulative volume at the same minute over recent days."""
+        try:
+            current_bar = day_bars.iloc[bar_idx]
+            minute = int(current_bar['minutes_from_open'])
+            cache_key = (symbol, str(trade_date), minute)
+            if cache_key in self.relative_volume_cache:
+                return self.relative_volume_cache[cache_key]
+
+            intraday = self.data.get(symbol, {}).get('intraday')
+            if intraday is None or intraday.empty:
+                return 1.0
+
+            current_cum_volume = float(day_bars.iloc[:bar_idx + 1]['volume'].sum())
+            prior_days = intraday[intraday['date'] < trade_date]
+            if prior_days.empty:
+                self.relative_volume_cache[cache_key] = 1.0
+                return 1.0
+
+            lookback_dates = sorted(prior_days['date'].unique())[-lookback_days:]
+            if not lookback_dates:
+                self.relative_volume_cache[cache_key] = 1.0
+                return 1.0
+
+            historical_slice = intraday[
+                intraday['date'].isin(lookback_dates) & (intraday['minutes_from_open'] <= minute)
+            ]
+            avg_cum_volume = historical_slice.groupby('date')['volume'].sum().mean()
+            if pd.isna(avg_cum_volume) or avg_cum_volume <= 0:
+                relative_volume = 1.0
+            else:
+                relative_volume = current_cum_volume / float(avg_cum_volume)
+
+            self.relative_volume_cache[cache_key] = float(relative_volume)
+            return float(relative_volume)
+
+        except Exception:
+            return 1.0
+
+    def _get_recent_return(self, day_bars: pd.DataFrame, bar_idx: int, lookback_bars: int) -> float:
+        """Return over the most recent N bars ending at the current bar."""
+        if bar_idx < lookback_bars:
+            return 0.0
+
+        current_price = day_bars.iloc[bar_idx]['close']
+        reference_price = day_bars.iloc[bar_idx - lookback_bars]['close']
+        if reference_price <= 0:
+            return 0.0
+        return float((current_price / reference_price) - 1)
+
+    def _get_recent_realized_vol(self, day_bars: pd.DataFrame, bar_idx: int, lookback_bars: int) -> float:
+        """Rolling realized volatility over the most recent N bars."""
+        start_idx = max(0, bar_idx - lookback_bars)
+        returns = day_bars.iloc[start_idx:bar_idx + 1]['close'].pct_change().dropna()
+        return self._safe_std(returns)
+
+    def _get_opening_range_features(
+        self,
+        day_bars: pd.DataFrame,
+        bar_idx: int,
+        current_price: float,
+        open_price: float,
+        opening_minutes: int = 30
+    ) -> tuple[float, float]:
+        """Width and price position within the opening range observed so far."""
+        current_minute = int(day_bars.iloc[bar_idx]['minutes_from_open'])
+        cutoff_minute = min(opening_minutes, current_minute)
+        opening_range = day_bars[day_bars['minutes_from_open'] <= cutoff_minute]
+
+        if opening_range.empty or open_price <= 0:
+            return 0.0, 0.5
+
+        orb_high = float(opening_range['high'].max())
+        orb_low = float(opening_range['low'].min())
+        range_width = orb_high - orb_low
+        opening_range_width = range_width / open_price if open_price > 0 else 0.0
+
+        if range_width <= 0:
+            opening_range_position = 0.5
+        else:
+            opening_range_position = (current_price - orb_low) / range_width
+
+        return float(opening_range_width), float(opening_range_position)
+
+    def _simulate_candidate_exit(
+        self,
+        symbol: str,
+        day_bars: pd.DataFrame,
+        entry_idx: int,
+        direction: int,
+        candidate_source: str,
+        upper_bounds: np.ndarray,
+        lower_bounds: np.ndarray,
+        vwap_prices: np.ndarray,
+        close_prices: np.ndarray,
+        minutes: np.ndarray,
+    ) -> tuple[int, float, str]:
+        """Simulate the raw candidate's exit under the strategy's native exit rule."""
+        exit_idx = len(day_bars) - 1
+
+        for future_idx in range(entry_idx + 1, len(day_bars)):
+            future_price = close_prices[future_idx]
+            future_vwap = vwap_prices[future_idx]
+            future_minute = minutes[future_idx]
+
+            if candidate_source == 'etf_momentum':
+                if future_minute < 30 or future_minute % self.trade_freq != 0:
+                    continue
+
+                future_signal = 0
+                if future_price > upper_bounds[future_idx] and future_price > future_vwap:
+                    future_signal = 1
+                elif future_price < lower_bounds[future_idx] and future_price < future_vwap:
+                    future_signal = -1
+
+                if future_signal != direction:
+                    exit_idx = future_idx
+                    break
+
+            elif candidate_source == 'stock_mean_reversion':
+                if direction == 1 and future_price >= future_vwap:
+                    exit_idx = future_idx
+                    break
+                if direction == -1 and future_price <= future_vwap:
+                    exit_idx = future_idx
+                    break
+
+            elif candidate_source == 'stock_gap':
+                entry_time = pd.to_datetime(day_bars.iloc[entry_idx]['datetime'])
+                future_time = pd.to_datetime(day_bars.iloc[future_idx]['datetime'])
+                held_minutes = (future_time - entry_time).total_seconds() / 60
+                if held_minutes >= self.gap_exit_minutes:
+                    exit_idx = future_idx
+                    break
+
+        exit_price = close_prices[exit_idx]
+        exit_timestamp = day_bars.iloc[exit_idx]['datetime']
+        return exit_idx, float(exit_price), exit_timestamp
+
+    def _active_ml_model_name(self) -> str | None:
+        """Return the active ML gate name."""
+        if self.ml_mode == 'ensemble':
+            return f"Ensemble[{self.ensemble_method}]"
+        if self.ml_mode == 'xgb':
+            return 'XGBoost'
+        if self.ml_mode == 'lgbm':
+            return 'LightGBM'
+        if self.ml_mode == 'rf':
+            return 'RandomForest'
+        return None
+
+    def _active_ml_confidence_threshold(self) -> float:
+        """Confidence threshold for whichever ML gate is active."""
+        if self.ml_mode == 'ensemble':
+            return self.ensemble_confidence_threshold
+        if self.ml_mode == 'xgb':
+            return self.xgb_confidence_threshold
+        if self.ml_mode == 'lgbm':
+            return self.lgbm_confidence_threshold
+        return self.rf_confidence_threshold
+
+    def get_ml_signal(self, features: dict) -> tuple:
+        """Route inference to the currently active ML gate."""
+        if self.ml_mode == 'ensemble':
+            return self.get_ensemble_signal(features)
+        if self.ml_mode == 'xgb' and self.xgb_model is not None:
+            return self.get_xgb_signal(features)
+        if self.ml_mode == 'lgbm' and self.lgbm_model is not None:
+            return self.get_lgbm_signal(features)
+        if self.ml_mode == 'rf' and self.rf_model is not None:
+            return self.get_rf_signal(features)
+        return None, 0.0
+
+    def _get_ensemble_components(self, features: dict) -> list:
+        """Collect available model probabilities for ensemble inference."""
+        components = []
+        if self.rf_model is not None:
+            rf_signal, rf_confidence = self.get_rf_signal(features)
+            if rf_signal is not None:
+                components.append({
+                    'name': 'rf',
+                    'signal': rf_signal,
+                    'confidence': rf_confidence,
+                    'weight': self.ensemble_rf_weight
+                })
+        if self.lgbm_model is not None:
+            lgbm_signal, lgbm_confidence = self.get_lgbm_signal(features)
+            if lgbm_signal is not None:
+                components.append({
+                    'name': 'lgbm',
+                    'signal': lgbm_signal,
+                    'confidence': lgbm_confidence,
+                    'weight': self.ensemble_lgbm_weight
+                })
+        if self.xgb_model is not None and self.ensemble_xgb_weight > 0:
+            xgb_signal, xgb_confidence = self.get_xgb_signal(features)
+            if xgb_signal is not None:
+                components.append({
+                    'name': 'xgb',
+                    'signal': xgb_signal,
+                    'confidence': xgb_confidence,
+                    'weight': self.ensemble_xgb_weight
+                })
+        return components
+
+    def get_ensemble_signal(self, features: dict) -> tuple:
+        """
+        Combine available model gates into an ensemble gate.
+
+        `prob_avg`: weighted average of trade-approval probabilities.
+        `agreement`: approve only when all available models approve; confidence is average approval probability.
+        """
+        if features is None:
+            return None, 0.0
+
+        components = self._get_ensemble_components(features)
+        if not components:
+            return None, 0.0
+
+        total_weight = sum(max(component['weight'], 0.0) for component in components)
+        if total_weight <= 0:
+            total_weight = float(len(components))
+            for component in components:
+                component['weight'] = 1.0
+
+        avg_trade_probability = sum(
+            component['confidence'] * component['weight'] for component in components
+        ) / total_weight
+
+        if self.ensemble_method == 'agreement':
+            all_trade = all(component['signal'] == 'TRADE' for component in components)
+            return ('TRADE' if all_trade else 'HOLD', avg_trade_probability)
+
+        # Default ensemble: weighted probability average
+        return ('TRADE' if avg_trade_probability >= 0.5 else 'HOLD', avg_trade_probability)
+
+    def _ml_gate_ready(self) -> bool:
+        """Whether the currently selected ML gate has a trained model available."""
+        if self.ml_mode == 'rf':
+            return self.rf_model is not None
+        if self.ml_mode == 'lgbm':
+            return self.lgbm_model is not None
+        if self.ml_mode == 'xgb':
+            return self.xgb_model is not None
+        if self.ml_mode == 'ensemble':
+            return (
+                self.rf_model is not None or
+                self.lgbm_model is not None or
+                self.xgb_model is not None
+            )
+        return False
 
     def load_from_csv(self, data_dir: str = None):
         """
@@ -1182,6 +1797,25 @@ class StrategyBacktester:
         else:
             print(f"  Warning: No VIX data found at {vix_file}")
             print(f"  To extract VIX: python -c \"from ibkr_backtest import extract_vix_data; extract_vix_data()\"")
+
+        # Phase B: load auxiliary index data (VIX9D/VIX3M/VVIX/DXY/TNX) used as
+        # ML features. Missing files don't fail the backtest — the feature
+        # extractor falls back to neutral defaults.
+        self.aux_index_data = {}  # {symbol: {date: close}}
+        for aux_symbol in DEFAULT_AUX_INDICES:
+            aux_file = os.path.join(data_dir or DATA_DIR, f'{aux_symbol}_daily.csv')
+            if os.path.exists(aux_file):
+                try:
+                    df_aux = pd.read_csv(aux_file)
+                    df_aux['date'] = pd.to_datetime(df_aux['date']).dt.date
+                    self.aux_index_data[aux_symbol] = dict(zip(df_aux['date'], df_aux['close']))
+                    print(f"  {aux_symbol}: Loaded {len(self.aux_index_data[aux_symbol])} days")
+                except Exception as e:
+                    print(f"  Warning: Failed to load {aux_file}: {e}")
+                    self.aux_index_data[aux_symbol] = {}
+            else:
+                self.aux_index_data[aux_symbol] = {}
+                print(f"  {aux_symbol}: file not found — feature will use neutral default")
 
         # Pre-compute statistics like original project
         self._precompute_statistics()
@@ -1614,6 +2248,69 @@ class StrategyBacktester:
                     self.allocations[symbol] = round(inv_vols[symbol] / total_inv_vol, 2)
 
     # ==========================================================================
+    # GAMMA-IMBALANCE FILTER (paper §4.5: β = -3.25, p = 0.001)
+    # Prior-day 5-day RSI as proxy for dealer gamma; low RSI → higher expected
+    # intraday-momentum return → boost size; high RSI → cut size.
+    # ==========================================================================
+
+    def _compute_prev_day_rsi5(self, symbol, trade_date):
+        """5-day RSI of `symbol` as of the close of the prior trading day.
+        Returns None if insufficient history."""
+        if symbol not in self.data or 'daily' not in self.data[symbol]:
+            return None
+        daily = self.data[symbol]['daily']
+        if daily is None or len(daily) < 7:
+            return None
+        # Use rows strictly before trade_date
+        trade_date_ts = pd.to_datetime(trade_date)
+        if 'date' in daily.columns:
+            prior = daily[pd.to_datetime(daily['date']) < trade_date_ts]
+        else:
+            prior = daily[daily.index < trade_date_ts]
+        if len(prior) < 6:
+            return None
+        closes = prior['close'].astype(float).tail(6).values
+        diffs = np.diff(closes)              # 5 day-over-day changes
+        gains = np.where(diffs > 0, diffs, 0.0)
+        losses = np.where(diffs < 0, -diffs, 0.0)
+        avg_gain = gains.mean()
+        avg_loss = losses.mean()
+        if avg_loss == 0:
+            return 100.0 if avg_gain > 0 else 50.0
+        rs = avg_gain / avg_loss
+        return float(100.0 - (100.0 / (1.0 + rs)))
+
+    @staticmethod
+    def _rsi_gamma_multiplier(rsi):
+        """Map prior-day RSI(5) to position-size multiplier.
+        RSI=30 → 1.4×, RSI=50 → 1.0×, RSI=70 → 0.6×. Clipped to [0.5, 1.5]."""
+        if rsi is None or (isinstance(rsi, float) and np.isnan(rsi)):
+            return 1.0
+        mult = 1.0 + (50.0 - rsi) * 0.02
+        return float(np.clip(mult, 0.5, 1.5))
+
+    @staticmethod
+    def _breadth_rs(rsp_closes, spy_closes, as_of_date):
+        """Market-breadth proxy: RSP 5-day return minus SPY 5-day return (equal-
+        weight vs cap-weight S&P). Mirrors ibkr2.EnhancedTradingStrategy
+        ._compute_breadth_rs. Uses only closes strictly before as_of_date."""
+        def ret5(m):
+            if not m:
+                return None
+            ds = sorted(d for d in m if d < as_of_date)
+            if len(ds) < 6:
+                return None
+            window = [m[d] for d in ds[-6:]]
+            if window[0] <= 0:
+                return None
+            return (window[-1] / window[0]) - 1.0
+        r = ret5(rsp_closes)
+        s = ret5(spy_closes)
+        if r is None or s is None:
+            return 0.0
+        return float(r - s)
+
+    # ==========================================================================
     # RANDOM FOREST METHODS (matching ibkr2.py)
     # ==========================================================================
 
@@ -1623,10 +2320,11 @@ class StrategyBacktester:
         trade_date,
         bar_idx: int,
         day_bars: pd.DataFrame,
-        prev_close: float
+        prev_close: float,
+        candidate_direction: int = 0
     ) -> dict:
         """
-        Extract features for RF prediction (matching ibkr2.py).
+        Extract features for ML gating using only information available at the current bar.
         Returns dict of features or None if extraction fails.
         """
         try:
@@ -1635,38 +2333,197 @@ class StrategyBacktester:
             open_price = day_bars.iloc[0]['open']
             current_vwap = bar['vwap']
             minutes_from_open = bar['minutes_from_open']
-
-            # Get datetime for day/hour features
             bar_datetime = pd.to_datetime(bar['datetime'])
+            is_etf_symbol = self.is_etf(symbol)
+            vix_level = float(self.vix_data.get(trade_date, 15.0))
 
-            features = {}
+            price_vs_open = (current_price / open_price) - 1 if open_price > 0 else 0.0
+            price_vs_vwap = (current_price / current_vwap) - 1 if current_vwap > 0 else 0.0
+            gap_size = (open_price / prev_close) - 1 if prev_close > 0 else 0.0
 
-            # Price features
-            features['price_vs_open'] = (current_price / open_price) - 1
-            features['price_vs_vwap'] = (current_price / current_vwap) - 1 if current_vwap > 0 else 0
+            sigma_base = self.calculate_intraday_sigma(symbol, trade_date, minutes_from_open)
+            har_scale = getattr(self, 'har_daily_scale', {}).get(symbol, 1.0) if self.use_har_forecast else 1.0
+            sigma_at_entry = sigma_base * har_scale
+            _, adaptive_vm = self._get_adaptive_params(trade_date)
+            adjusted_sigma = sigma_at_entry * adaptive_vm
 
-            # Volatility features
-            features['realized_vol'] = self.egarch_vol.get(symbol, {}).get(trade_date, 0.02)
+            anchor_high = max(open_price, prev_close) if prev_close > 0 else open_price
+            anchor_low = min(open_price, prev_close) if prev_close > 0 else open_price
+            upper_bound = anchor_high * (1 + adjusted_sigma)
+            lower_bound = anchor_low * (1 - adjusted_sigma)
 
-            # Gap size (open vs prev close)
-            features['gap_size'] = (open_price / prev_close) - 1 if prev_close > 0 else 0
+            relative_volume = self._get_relative_volume(symbol, trade_date, day_bars, bar_idx)
+            return_5m = self._get_recent_return(day_bars, bar_idx, lookback_bars=5)
+            return_15m = self._get_recent_return(day_bars, bar_idx, lookback_bars=15)
+            realized_vol_5m = self._get_recent_realized_vol(day_bars, bar_idx, lookback_bars=5)
+            realized_vol_15m = self._get_recent_realized_vol(day_bars, bar_idx, lookback_bars=15)
+            opening_range_width, opening_range_position = self._get_opening_range_features(
+                day_bars, bar_idx, current_price, open_price
+            )
 
-            # Time features
-            features['minutes_from_open'] = minutes_from_open
-            features['hour_of_day'] = bar_datetime.hour
-            features['day_of_week'] = bar_datetime.dayofweek
+            stock_vol_rank = 0.5
+            if not is_etf_symbol and self.use_stock_vol_regime:
+                cached_regime = self.stock_vol_regimes.get(symbol, {}).get(trade_date)
+                if cached_regime is None:
+                    _, stock_vol_rank = self.calculate_stock_vol_regime(symbol, trade_date)
+                else:
+                    _, stock_vol_rank = cached_regime
+                if stock_vol_rank is None:
+                    stock_vol_rank = 0.5
 
-            # Volume ratio (today vs average) - simplified
-            today_volume = day_bars.iloc[:bar_idx+1]['volume'].sum() if bar_idx > 0 else bar['volume']
-            avg_volume = day_bars['volume'].mean() * (bar_idx + 1) if bar_idx > 0 else day_bars['volume'].mean()
-            features['volume_ratio'] = today_volume / avg_volume if avg_volume > 0 else 1.0
+            # Phase A: deterministic calendar features (same as ibkr2.py live RF)
+            try:
+                from event_calendar import (
+                    is_opex_day, is_day_after_opex,
+                    days_to_fomc, days_to_cpi, days_to_nfp,
+                )
+                opex_flag      = 1 if is_opex_day(trade_date) else 0
+                after_opex_flag = 1 if is_day_after_opex(trade_date) else 0
+                d_fomc = float(days_to_fomc(trade_date))
+                d_cpi  = float(days_to_cpi(trade_date))
+                d_nfp  = float(days_to_nfp(trade_date))
+            except Exception:
+                opex_flag = 0
+                after_opex_flag = 0
+                d_fomc = d_cpi = d_nfp = 30.0
 
-            # First half-hour return (open to 10:00 AM)
-            features['first_half_return'] = self.open_returns.get(symbol, {}).get(trade_date, 0)
+            # Phase B: VIX term structure & cross-asset features.
+            # Look up PRIOR trading day's close (no look-ahead) for each index.
+            # Missing data → neutral defaults that won't blow up the model.
+            aux = getattr(self, 'aux_index_data', {}) or {}
+
+            def _prior_close(series_map, default):
+                """Most recent date <= trade_date in `series_map` (no look-ahead).
+                Uses < trade_date to be safe — VIX closing print is only known
+                after the close, so a same-day lookup would peek."""
+                if not series_map:
+                    return default
+                candidates = [d for d in series_map.keys() if d < trade_date]
+                if not candidates:
+                    return default
+                return float(series_map[max(candidates)])
+
+            vix_today  = float(vix_level) if vix_level else 15.0
+            vix9d_val  = _prior_close(aux.get('VIX9D', {}), default=15.0)
+            vix3m_val  = _prior_close(aux.get('VIX3M', {}), default=18.0)
+            vvix_val   = _prior_close(aux.get('VVIX',  {}), default=90.0)
+            # `dxy_level` feature is populated from UUP (dollar ETF) since DXY
+            # requires an ICE subscription. UUP price ≈ 28-30 (not 100 like DXY)
+            # but the ML cares about variation, not magnitude.
+            dxy_val    = _prior_close(aux.get('UUP',   {}), default=28.0)
+            tnx_val    = _prior_close(aux.get('TNX',   {}), default=42.0)
+
+            vix_term_slope = (vix9d_val / vix_today) if vix_today > 0 else 1.0
+            vix3m_ratio    = (vix_today / vix3m_val) if vix3m_val > 0 else 1.0
+
+            # Phase C: psychological price levels (% distance from current price)
+            # + closing-auction context. Levels from daily bars strictly before
+            # trade_date (no look-ahead).
+            def _level_dist(level):
+                if level is None or level <= 0 or current_price <= 0:
+                    return 0.0
+                return float((current_price / level) - 1.0)
+
+            pdh = pdl = pwh = pwl = h52 = None
+            try:
+                daily = self.data.get(symbol, {}).get('daily')
+                if daily is not None and len(daily) > 0:
+                    dcol = pd.to_datetime(daily['date']) if 'date' in daily.columns else daily.index.to_series()
+                    prior = daily[dcol.values < pd.to_datetime(trade_date)]
+                    if len(prior) >= 1:
+                        last = prior.iloc[-1]
+                        pdh = float(last['high']); pdl = float(last['low'])
+                        wk = prior.tail(5)
+                        pwh = float(wk['high'].max()); pwl = float(wk['low'].min())
+                        h52 = float(prior['high'].tail(252).max())
+            except Exception:
+                pass
+
+            minutes_to_close = max(0, 390 - int(minutes_from_open))
+            last_30min_flag = 1 if minutes_to_close <= 30 else 0
+
+            # Parity features that live ibkr2.py also produces:
+            #   volume_ratio, hour_of_day, sma_20_vs_price, breadth_rs
+            hour_of_day = float(bar_datetime.hour)
+            try:
+                bars_so_far = day_bars.iloc[:bar_idx + 1]
+                v = bars_so_far['volume'].astype(float)
+                vmean = v.mean()
+                volume_ratio = float(v.sum() / vmean) if vmean > 0 else 1.0
+            except Exception:
+                volume_ratio = 1.0
+            try:
+                closes_so_far = day_bars.iloc[:bar_idx + 1]['close'].astype(float)
+                sma20 = closes_so_far.tail(20).mean()
+                sma_20_vs_price = float((current_price / sma20) - 1.0) if sma20 > 0 else 0.0
+            except Exception:
+                sma_20_vs_price = 0.0
+            # Market breadth: RSP vs SPY 5-day relative strength (prior day, no look-ahead)
+            try:
+                rsp_closes = aux.get('RSP', {})
+                spy_daily = self.data.get('SPY', {}).get('daily')
+                spy_closes = {}
+                if spy_daily is not None and len(spy_daily) > 0:
+                    scol = pd.to_datetime(spy_daily['date']) if 'date' in spy_daily.columns else spy_daily.index.to_series()
+                    spy_closes = dict(zip([d.date() if hasattr(d, 'date') else d for d in scol], spy_daily['close'].astype(float)))
+                breadth_rs = self._breadth_rs(rsp_closes, spy_closes, trade_date)
+            except Exception:
+                breadth_rs = 0.0
+
+            features = {
+                'trade_direction': int(np.sign(candidate_direction)),
+                'is_etf': 1 if is_etf_symbol else 0,
+                'price_vs_open': float(price_vs_open),
+                'price_vs_vwap': float(price_vs_vwap),
+                'realized_vol': float(self.egarch_vol.get(symbol, {}).get(trade_date, 0.02)),
+                'gap_size': float(gap_size),
+                'vix_level': vix_level,
+                'minutes_from_open': float(minutes_from_open),
+                'day_of_week': float(bar_datetime.dayofweek),
+                'first_half_return': float(self.open_returns.get(symbol, {}).get(trade_date, 0.0)),
+                'sigma_at_entry': float(sigma_at_entry),
+                'move_over_sigma': float(price_vs_open / sigma_at_entry) if sigma_at_entry > 0 else 0.0,
+                'gap_over_sigma': float(gap_size / sigma_at_entry) if sigma_at_entry > 0 else 0.0,
+                'distance_to_upper_bound': float((current_price / upper_bound) - 1) if upper_bound > 0 else 0.0,
+                'distance_to_lower_bound': float((current_price / lower_bound) - 1) if lower_bound > 0 else 0.0,
+                'relative_volume': float(relative_volume),
+                'return_5m': float(return_5m),
+                'return_15m': float(return_15m),
+                'realized_vol_5m': float(realized_vol_5m),
+                'realized_vol_15m': float(realized_vol_15m),
+                'opening_range_width': float(opening_range_width),
+                'opening_range_position': float(opening_range_position),
+                'stock_vol_rank': float(stock_vol_rank),
+                # Phase A calendar features (mirrors ibkr2.py live RF)
+                'is_opex_day': opex_flag,
+                'is_day_after_opex': after_opex_flag,
+                'days_to_fomc': d_fomc,
+                'days_to_cpi': d_cpi,
+                'days_to_nfp': d_nfp,
+                # Phase B index features (from aux_index_data CSVs)
+                'vix_term_slope': float(vix_term_slope),
+                'vix3m_ratio':    float(vix3m_ratio),
+                'vvix_level':     float(vvix_val),
+                'dxy_level':      float(dxy_val),
+                'tnx_level':      float(tnx_val),
+                # Phase C: psychological levels + closing-auction
+                'dist_prev_day_high':  _level_dist(pdh),
+                'dist_prev_day_low':   _level_dist(pdl),
+                'dist_prev_week_high': _level_dist(pwh),
+                'dist_prev_week_low':  _level_dist(pwl),
+                'dist_52w_high':       _level_dist(h52),
+                'minutes_to_close':    float(minutes_to_close),
+                'last_30min_flag':     float(last_30min_flag),
+                # Parity with live ibkr2.py feature space
+                'volume_ratio':        float(volume_ratio),
+                'hour_of_day':         hour_of_day,
+                'sma_20_vs_price':     float(sma_20_vs_price),
+                'breadth_rs':          float(breadth_rs),
+            }
 
             return features
 
-        except Exception as e:
+        except Exception:
             return None
 
     def train_rf_model(self, walk_forward_window: int = None):
@@ -1699,7 +2556,7 @@ class StrategyBacktester:
             y = []
 
             for sample in training_data:
-                X.append(list(sample['features'].values()))
+                X.append(self._ordered_feature_values(sample['features']))
                 y.append(sample['label'])
 
             X = np.array(X)
@@ -1758,27 +2615,168 @@ class StrategyBacktester:
         except Exception as e:
             print(f"    Error training RF: {e}")
 
+    def train_lgbm_model(self, walk_forward_window: int = None):
+        """
+        Train LightGBM model using the same walk-forward methodology as RF.
+        """
+        if len(self.rf_training_data) < self.lgbm_min_samples:
+            return
+
+        try:
+            sorted_data = sorted(self.rf_training_data, key=lambda x: x.get('timestamp', datetime.min))
+
+            if walk_forward_window and len(sorted_data) > walk_forward_window:
+                training_data = sorted_data[-walk_forward_window:]
+            else:
+                training_data = sorted_data
+
+            X = []
+            y = []
+
+            for sample in training_data:
+                X.append(self._ordered_feature_values(sample['features']))
+                y.append(sample['label'])
+
+            X = np.array(X)
+            y = np.array(y)
+
+            unique, counts = np.unique(y, return_counts=True)
+            if len(unique) < 2:
+                return
+
+            max_count = max(counts)
+            min_count = min(counts)
+            imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
+            class_weight = 'balanced' if imbalance_ratio > 3 else None
+
+            split_idx = int(len(X) * 0.8)
+            X_train, X_val = X[:split_idx], X[split_idx:]
+            y_train, y_val = y[:split_idx], y[split_idx:]
+
+            if len(X_train) < 20 or len(X_val) < 5:
+                X_train, y_train = X, y
+                X_val, y_val = None, None
+
+            self.lgbm_model = LGBMClassifier(
+                n_estimators=100,
+                learning_rate=0.05,
+                num_leaves=15,
+                max_depth=5,
+                min_child_samples=10,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=0.1,
+                random_state=42,
+                class_weight=class_weight,
+                verbosity=-1,
+                force_col_wise=True
+            )
+
+            self.lgbm_model.fit(X_train, y_train)
+
+            if X_val is not None and len(X_val) > 0:
+                val_score = self.lgbm_model.score(X_val, y_val)
+                print(f"    LGBM Walk-Forward: train={len(X_train)}, val={len(X_val)}, val_acc={val_score:.2f}")
+                self.lgbm_val_scores.append(val_score)
+
+        except Exception as e:
+            print(f"    Error training LightGBM: {e}")
+
+    def train_xgb_model(self, walk_forward_window: int = None):
+        """
+        Train XGBoost model using the same walk-forward methodology as RF.
+        """
+        if len(self.rf_training_data) < self.xgb_min_samples:
+            return
+
+        try:
+            sorted_data = sorted(self.rf_training_data, key=lambda x: x.get('timestamp', datetime.min))
+
+            if walk_forward_window and len(sorted_data) > walk_forward_window:
+                training_data = sorted_data[-walk_forward_window:]
+            else:
+                training_data = sorted_data
+
+            X = []
+            y = []
+
+            for sample in training_data:
+                X.append(self._ordered_feature_values(sample['features']))
+                y.append(sample['label'])
+
+            X = np.array(X)
+            y = np.array(y)
+
+            unique, counts = np.unique(y, return_counts=True)
+            if len(unique) < 2:
+                return
+
+            count_by_class = dict(zip(unique, counts))
+            negative_count = count_by_class.get(0, 0)
+            positive_count = count_by_class.get(1, 0)
+            if positive_count <= 0 or negative_count <= 0:
+                return
+
+            max_count = max(counts)
+            min_count = min(counts)
+            imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
+            scale_pos_weight = negative_count / positive_count if imbalance_ratio > 3 else 1.0
+
+            split_idx = int(len(X) * 0.8)
+            X_train, X_val = X[:split_idx], X[split_idx:]
+            y_train, y_val = y[:split_idx], y[split_idx:]
+
+            if len(X_train) < 20 or len(X_val) < 5:
+                X_train, y_train = X, y
+                X_val, y_val = None, None
+
+            self.xgb_model = XGBClassifier(
+                n_estimators=100,
+                learning_rate=0.05,
+                max_depth=4,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
+                objective='binary:logistic',
+                eval_metric='logloss',
+                random_state=42,
+                n_jobs=-1,
+                tree_method='hist',
+                scale_pos_weight=scale_pos_weight,
+            )
+
+            self.xgb_model.fit(X_train, y_train)
+
+            if X_val is not None and len(X_val) > 0:
+                val_score = self.xgb_model.score(X_val, y_val)
+                print(f"    XGB Walk-Forward: train={len(X_train)}, val={len(X_val)}, val_acc={val_score:.2f}")
+                self.xgb_val_scores.append(val_score)
+
+        except Exception as e:
+            print(f"    Error training XGBoost: {e}")
+
     def get_rf_signal(self, features: dict) -> tuple:
         """
         Get RF prediction and confidence.
-        Returns (signal, confidence) where signal is 'BUY' or 'HOLD'.
+        Returns (signal, confidence) where signal is 'TRADE' or 'HOLD'.
         """
         if self.rf_model is None or features is None:
             return None, 0.0
 
         try:
-            feature_array = np.array([list(features.values())])
+            feature_array = np.array([self._ordered_feature_values(features)])
             feature_scaled = self.rf_scaler.transform(feature_array)
 
             rf_signal = self.rf_model.predict(feature_scaled)[0]
             rf_proba = self.rf_model.predict_proba(feature_scaled)[0]
 
-            # Binary: 1=BUY, 0=HOLD
-            signal_str = 'BUY' if rf_signal == 1 else 'HOLD'
+            signal_str = 'TRADE' if rf_signal == 1 else 'HOLD'
 
             # Confidence
             if len(rf_proba) > 1:
-                confidence = rf_proba[1]  # Probability of BUY
+                confidence = rf_proba[1]  # Probability this candidate trade is profitable
             else:
                 confidence = rf_proba[0] if rf_signal == 1 else 1 - rf_proba[0]
 
@@ -1787,9 +2785,53 @@ class StrategyBacktester:
         except Exception:
             return None, 0.0
 
+    def get_lgbm_signal(self, features: dict) -> tuple:
+        """
+        Get LightGBM prediction and confidence.
+        Returns (signal, confidence) where signal is 'TRADE' or 'HOLD'.
+        """
+        if self.lgbm_model is None or features is None:
+            return None, 0.0
+
+        try:
+            feature_array = np.array([self._ordered_feature_values(features)])
+            lgbm_signal = self.lgbm_model.predict(feature_array)[0]
+            lgbm_proba = self.lgbm_model.predict_proba(feature_array)[0]
+
+            signal_str = 'TRADE' if lgbm_signal == 1 else 'HOLD'
+            confidence = lgbm_proba[1] if len(lgbm_proba) > 1 else float(lgbm_proba[0])
+            return signal_str, confidence
+
+        except Exception:
+            return None, 0.0
+
+    def get_xgb_signal(self, features: dict) -> tuple:
+        """
+        Get XGBoost prediction and trade probability.
+        Returns (signal, confidence) where signal is 'TRADE' or 'HOLD'.
+        """
+        if self.xgb_model is None or features is None:
+            return None, 0.0
+
+        try:
+            feature_array = np.array([self._ordered_feature_values(features)])
+            xgb_signal = self.xgb_model.predict(feature_array)[0]
+            xgb_proba = self.xgb_model.predict_proba(feature_array)[0]
+
+            signal_str = 'TRADE' if xgb_signal == 1 else 'HOLD'
+            if hasattr(self.xgb_model, 'classes_') and 1 in self.xgb_model.classes_:
+                trade_idx = list(self.xgb_model.classes_).index(1)
+                confidence = float(xgb_proba[trade_idx])
+            else:
+                confidence = float(xgb_proba[1]) if len(xgb_proba) > 1 else float(xgb_proba[0])
+            return signal_str, confidence
+
+        except Exception:
+            return None, 0.0
+
     def record_trade_outcome(self, features: dict, entry_price: float, exit_price: float,
                              signal: str, timestamp):
-        """Record trade outcome for RF training."""
+        """Record trade outcome for the active ML training set."""
         if features is None:
             return
 
@@ -1799,8 +2841,8 @@ class StrategyBacktester:
         else:
             profit_pct = (entry_price / exit_price) - 1
 
-        # Binary label: 1=profitable trade, 0=not profitable
-        label = 1 if profit_pct > 0.002 else 0
+        # Binary label: 1=profitable trade above threshold, 0=not profitable enough
+        label = 1 if profit_pct > self.ml_profit_target_pct else 0
 
         self.rf_training_data.append({
             'features': features,
@@ -1810,8 +2852,13 @@ class StrategyBacktester:
         })
 
         # Retrain periodically using walk-forward window
-        if len(self.rf_training_data) % 30 == 0 and len(self.rf_training_data) >= self.rf_min_samples:
-            self.train_rf_model(walk_forward_window=self.rf_walk_forward_window)
+        if len(self.rf_training_data) % 30 == 0:
+            if self.use_rf and len(self.rf_training_data) >= self.rf_min_samples:
+                self.train_rf_model(walk_forward_window=self.rf_walk_forward_window)
+            if self.use_lgbm and len(self.rf_training_data) >= self.lgbm_min_samples:
+                self.train_lgbm_model(walk_forward_window=self.lgbm_walk_forward_window)
+            if self.use_xgb and len(self.rf_training_data) >= self.xgb_min_samples:
+                self.train_xgb_model(walk_forward_window=self.xgb_walk_forward_window)
 
     # ==========================================================================
     # SWING MOMENTUM STRATEGY METHODS (for low VIX regimes)
@@ -2176,7 +3223,7 @@ class StrategyBacktester:
         Returns:
             True if ETF (uses momentum strategy), False if stock (uses mean reversion/gap)
         """
-        return symbol.upper() in ['SPY', 'QQQ']
+        return symbol.upper() in ['SPY', 'QQQ', 'IWM']
 
     def calculate_stock_vol_regime(self, symbol: str, trade_date, lookback: int = None) -> tuple:
         """
@@ -2644,11 +3691,64 @@ class StrategyBacktester:
 
         return 'HOLD'
 
-    def apply_transaction_costs(self, price: float, shares: int) -> float:
-        """Calculate total transaction cost."""
-        commission = self.commission_per_share * abs(shares)
-        slippage = 0.001 * abs(shares)
-        return commission + slippage
+    @staticmethod
+    def _empty_execution_cost_totals() -> dict:
+        """Return a fresh aggregate cost ledger for one backtest run."""
+        return {
+            'notional': 0.0,
+            'commission': 0.0,
+            'spread': 0.0,
+            'slippage': 0.0,
+            'impact': 0.0,
+            'total': 0.0,
+        }
+
+    @staticmethod
+    def _exposure_change_orders(exposure, close_prices) -> list:
+        """Return ``(bar_index, exposure_delta, trade_price)`` executions.
+
+        Exposure at bar ``i`` earns the price change into that bar.  A change
+        from bar ``i`` to ``i + 1`` therefore executes at bar ``i``'s close;
+        the final element closes any remaining position at the last close.
+        """
+        exposure = np.asarray(exposure, dtype=float)
+        close_prices = np.asarray(close_prices, dtype=float)
+        if exposure.ndim != 1 or close_prices.ndim != 1:
+            raise ValueError("exposure and close_prices must be one-dimensional")
+        if len(exposure) != len(close_prices):
+            raise ValueError("exposure and close_prices must have equal length")
+        if len(exposure) == 0:
+            return []
+
+        exposure_changes = np.diff(np.append(exposure, 0.0))
+        return [
+            (int(index), float(exposure_changes[index]), float(close_prices[index]))
+            for index in np.flatnonzero(exposure_changes)
+        ]
+
+    def apply_transaction_costs(
+        self,
+        price: float,
+        shares: float,
+        return_estimate: bool = False,
+    ):
+        """Estimate and record the one-way cost of an execution.
+
+        ``shares`` may be signed and may represent more than one unit of the
+        strategy position.  That matters for a direct long-to-short reversal,
+        which trades twice the base position.  Existing callers continue to
+        receive the dollar total; the optional estimate exposes components for
+        reporting without duplicating the model calculation.
+        """
+        estimate = estimate_execution_cost(
+            shares=shares,
+            price=price,
+            config=self.cost_model_config,
+        )
+        for component in ('notional', 'commission', 'spread', 'slippage', 'impact'):
+            self.execution_cost_totals[component] += getattr(estimate, component)
+        self.execution_cost_totals['total'] += estimate.total
+        return estimate if return_estimate else estimate.total
 
     def run_backtest(self, long_only: bool = True) -> pd.DataFrame:
         """
@@ -2660,13 +3760,33 @@ class StrategyBacktester:
         if not self.data:
             self.fetch_data()
 
+        # A StrategyBacktester instance can be run more than once in research
+        # scripts; cost reporting should describe this run, not accumulate.
+        self.execution_cost_totals = self._empty_execution_cost_totals()
+
         print(f"\nRunning backtest from {self.start_date} to {self.end_date}...")
         print(f"  Long only: {long_only}")
         print(f"  Initial capital: ${self.initial_capital:,.0f}")
         print(f"  Trade frequency: Every {self.trade_freq} minutes after 10:00 AM")
         print(f"  Target volatility: {self.target_vol:.0%}")
         print(f"  Max leverage: {self.max_leverage}x")
-        print(f"  RF signals: {'Enabled' if self.use_rf else 'Disabled'}")
+        ml_gate = self._active_ml_model_name()
+        if self.ml_mode == 'lgbm':
+            print(f"  ML gate: LightGBM (threshold={self.lgbm_confidence_threshold:.2f})")
+        elif self.ml_mode == 'xgb':
+            print(f"  ML gate: XGBoost (threshold={self.xgb_confidence_threshold:.2f})")
+        elif self.ml_mode == 'rf':
+            print(f"  ML gate: RandomForest (threshold={self.rf_confidence_threshold:.2f})")
+        elif self.ml_mode == 'ensemble':
+            print(
+                f"  ML gate: {ml_gate} "
+                f"(threshold={self.ensemble_confidence_threshold:.2f}, "
+                f"rf_w={self.ensemble_rf_weight:.2f}, "
+                f"lgbm_w={self.ensemble_lgbm_weight:.2f}, "
+                f"xgb_w={self.ensemble_xgb_weight:.2f})"
+            )
+        else:
+            print("  ML gate: Disabled")
         vix_filter_str = 'Disabled'
         if self.vix_min is not None and self.vix_max is not None:
             vix_filter_str = f'VIX {self.vix_min} to {self.vix_max}'
@@ -2679,6 +3799,8 @@ class StrategyBacktester:
         if self.use_autocorr_filter:
             print(f"  Autocorr Filter: Enabled (lookback={self.autocorr_lookback}, threshold={self.autocorr_threshold})")
             print(f"    → Override VIX filter if market is trending (autocorr > {self.autocorr_threshold})")
+
+        self.ml_gate_stats = self._create_ml_gate_stats()
         if self.skip_danger_zone:
             print(f"  Danger zone: Skip VIX {self.danger_zone_min}-{self.danger_zone_max} (cash only)")
         swing_desc = 'Disabled'
@@ -2735,6 +3857,7 @@ class StrategyBacktester:
 
         for day_idx, trade_date in enumerate(trading_dates):
             daily_pnl = 0.0
+            day_ml_training_samples = []
             # Progress reporting
             if day_idx % 100 == 0:
                 pct = (day_idx / total_days) * 100
@@ -2892,12 +4015,25 @@ class StrategyBacktester:
                 if exit_reason:
                     entry_price = pos['entry_price']
                     shares = pos['quantity']
-                    exit_cost = self.apply_transaction_costs(current_price, shares)
+                    exit_estimate = self.apply_transaction_costs(
+                        current_price,
+                        shares,
+                        return_estimate=True,
+                    )
+                    exit_cost = exit_estimate.total
+                    entry_cost = float(pos.get('entry_transaction_cost', 0.0))
                     proceeds = shares * current_price - exit_cost
-                    pnl = (current_price - entry_price) * shares - exit_cost
+                    pnl = (
+                        (current_price - entry_price) * shares
+                        - entry_cost
+                        - exit_cost
+                    )
 
-                    capital += proceeds  # Add full sale proceeds
-                    daily_pnl += pnl  # PnL for reporting
+                    # Swing holdings use cash accounting: entry notional/cost
+                    # left cash when opened, and net sale proceeds return here.
+                    # Adding ``pnl`` to daily_pnl as well would count the same
+                    # realized result twice when daily_pnl is added to capital.
+                    capital += proceeds
 
                     self.swing_trades.append({
                         'type': 'SWING',
@@ -2909,7 +4045,14 @@ class StrategyBacktester:
                         'exit_reason': exit_reason,
                         'shares': shares,
                         'pnl': pnl,
-                        'return': (current_price / entry_price) - 1
+                        'return': (current_price / entry_price) - 1,
+                        'entry_transaction_cost': entry_cost,
+                        'exit_transaction_cost': exit_cost,
+                        'transaction_cost': entry_cost + exit_cost,
+                        'commission': pos.get('entry_commission', 0.0) + exit_estimate.commission,
+                        'spread': pos.get('entry_spread', 0.0) + exit_estimate.spread,
+                        'slippage': pos.get('entry_slippage', 0.0) + exit_estimate.slippage,
+                        'impact': pos.get('entry_impact', 0.0) + exit_estimate.impact,
                     })
 
                     print(f"    [SWING EXIT] {symbol}: {exit_reason}, PnL: ${pnl:,.2f}")
@@ -2941,7 +4084,12 @@ class StrategyBacktester:
                             continue
 
                         # Entry cost
-                        entry_cost = self.apply_transaction_costs(current_price, shares)
+                        entry_estimate = self.apply_transaction_costs(
+                            current_price,
+                            shares,
+                            return_estimate=True,
+                        )
+                        entry_cost = entry_estimate.total
                         atr = self.calculate_swing_atr(symbol, trade_date)
                         
                         # Use wider stops in strict mode or if explicitly enabled
@@ -2955,13 +4103,20 @@ class StrategyBacktester:
                             'entry_date': trade_date,
                             'highest_price': current_price,
                             'trailing_stop': current_price - (atr_mult * atr) if atr else current_price * 0.93,
-                            'atr': atr if atr else current_price * 0.02
+                            'atr': atr if atr else current_price * 0.02,
+                            'entry_transaction_cost': entry_cost,
+                            'entry_commission': entry_estimate.commission,
+                            'entry_spread': entry_estimate.spread,
+                            'entry_slippage': entry_estimate.slippage,
+                            'entry_impact': entry_estimate.impact,
                         }
 
                         # Deduct full position cost from capital (shares + transaction costs)
                         position_cost = shares * current_price + entry_cost
                         capital -= position_cost
-                        daily_pnl -= entry_cost  # Only transaction costs affect daily PnL
+                        # The entry fee is already included in the cash debit
+                        # above and therefore in capital + swing_value.  Do not
+                        # subtract it again through daily_pnl.
 
                         momentum = self.calculate_swing_momentum(symbol, trade_date)
                         autocorr = self.calculate_autocorrelation(symbol, trade_date) if self.swing_strict_mode else None
@@ -3003,6 +4158,7 @@ class StrategyBacktester:
             # Intraday position tracking (reset each day - all intraday positions close at EOD)
             # Tracks: {'symbol': {'direction': 1 or -1, 'entry_price': float, 'entry_vwap': float}}
             self.intraday_positions = {}  # Clear at start of each day
+            self.gap_positions = {}  # Gap trades are intraday-only too
 
             # Process each symbol for this day
             for symbol in self.symbols:
@@ -3041,6 +4197,7 @@ class StrategyBacktester:
                 signals = np.zeros(len(day_bars))
                 upper_bounds = np.zeros(len(day_bars))
                 lower_bounds = np.zeros(len(day_bars))
+                commanded_position = 0  # Position implied by the last actionable trade bar
 
                 # ============================================================
                 # STRATEGY ROUTING: ETF (momentum) vs Stock (mean reversion/gap)
@@ -3059,6 +4216,7 @@ class StrategyBacktester:
 
                 for bar_idx in range(len(day_bars)):
                     mins_from_open = minutes[bar_idx]
+                    is_trade_bar = mins_from_open >= 30 and mins_from_open % self.trade_freq == 0
 
                     # Get VIX-adaptive parameters if enabled
                     if self.use_vix_adaptive:
@@ -3171,21 +4329,27 @@ class StrategyBacktester:
                     # SIGNAL GENERATION: Route based on symbol type
                     # ============================================================
                     base_signal = 0  # Start with no signal
+                    current_price = close_prices[bar_idx]
+                    current_vwap = vwap_prices[bar_idx]
+                    candidate_intraday_entry = None
+                    candidate_intraday_exit = False
+                    candidate_gap_entry = None
+                    candidate_gap_exit = False
+                    candidate_source = None
 
                     if is_etf_symbol:
                         # ETF STRATEGY: Momentum (follow breakouts)
                         # ZARATTINI SIGNALS: Noise boundary breakout WITH VWAP confirmation
                         if close_prices[bar_idx] > upper_bounds[bar_idx] and close_prices[bar_idx] > vwap_prices[bar_idx]:
                             base_signal = 1  # LONG
+                            candidate_source = 'etf_momentum'
                         elif close_prices[bar_idx] < lower_bounds[bar_idx] and close_prices[bar_idx] < vwap_prices[bar_idx]:
                             base_signal = -1  # SHORT
+                            candidate_source = 'etf_momentum'
                     else:
                         # STOCK STRATEGY: Mean reversion or gap capture
                         if self.stock_strategy_mode in ['mean_reversion', 'hybrid', 'vol_adaptive']:
                             # Mean reversion with VWAP exit target
-                            current_price = close_prices[bar_idx]
-                            current_vwap = vwap_prices[bar_idx]
-
                             # Check if we have an open position for this symbol
                             intraday_pos = self.intraday_positions.get(symbol)
 
@@ -3197,7 +4361,7 @@ class StrategyBacktester:
                                     # Exit when price reverts UP to VWAP
                                     if current_price >= current_vwap:
                                         base_signal = 0  # EXIT
-                                        del self.intraday_positions[symbol]
+                                        candidate_intraday_exit = True
                                     else:
                                         base_signal = 1  # Stay long
 
@@ -3205,7 +4369,7 @@ class StrategyBacktester:
                                     # Exit when price reverts DOWN to VWAP
                                     if current_price <= current_vwap:
                                         base_signal = 0  # EXIT
-                                        del self.intraday_positions[symbol]
+                                        candidate_intraday_exit = True
                                     else:
                                         base_signal = -1  # Stay short
                             else:
@@ -3222,16 +4386,16 @@ class StrategyBacktester:
 
                                 if signal_str == 'BUY':
                                     base_signal = 1
-                                    # Record entry
-                                    self.intraday_positions[symbol] = {
+                                    candidate_source = 'stock_mean_reversion'
+                                    candidate_intraday_entry = {
                                         'direction': 1,
                                         'entry_price': current_price,
                                         'entry_vwap': current_vwap
                                     }
                                 elif signal_str == 'SELL':
                                     base_signal = -1
-                                    # Record entry
-                                    self.intraday_positions[symbol] = {
+                                    candidate_source = 'stock_mean_reversion'
+                                    candidate_intraday_entry = {
                                         'direction': -1,
                                         'entry_price': current_price,
                                         'entry_vwap': current_vwap
@@ -3254,44 +4418,138 @@ class StrategyBacktester:
 
                             if gap_signal == 'BUY':
                                 base_signal = 1
+                                candidate_source = 'stock_gap'
+                                candidate_intraday_entry = None
+                                candidate_gap_entry = {
+                                    'entry_time': bar_time,
+                                    'entry_price': current_price,
+                                    'direction': 1,
+                                }
                             elif gap_signal == 'SELL':
                                 base_signal = -1
+                                candidate_source = 'stock_gap'
+                                candidate_intraday_entry = None
+                                candidate_gap_entry = {
+                                    'entry_time': bar_time,
+                                    'entry_price': current_price,
+                                    'direction': -1,
+                                }
                             elif gap_signal == 'EXIT' and symbol in self.gap_positions:
                                 # Exit gap position
                                 base_signal = 0
-                                del self.gap_positions[symbol]
+                                candidate_gap_exit = True
 
                     # ============================================================
-                    # RF FILTERING: Only take trades if RF model is confident
+                    # ML FILTERING: Only gate fresh entries/reversals, never holds/exits
                     # ============================================================
                     final_signal = base_signal
 
-                    if self.use_rf and base_signal != 0 and self.rf_model is not None:
-                        # Extract features for this bar
-                        rf_features = self.extract_rf_features(
-                            symbol, trade_date, bar_idx, day_bars, prev_closes[symbol]
+                    ml_model_name = self._active_ml_model_name()
+                    ml_model_ready = self._ml_gate_ready()
+                    is_entry_candidate = is_trade_bar and base_signal != 0 and base_signal != commanded_position
+
+                    if is_entry_candidate:
+                        self.ml_gate_stats['base_candidates'] += 1
+                        if base_signal > 0:
+                            self.ml_gate_stats['long_candidates'] += 1
+                        else:
+                            self.ml_gate_stats['short_candidates'] += 1
+
+                        if ml_model_name is not None and not ml_model_ready:
+                            self.ml_gate_stats['warmup_passthrough'] += 1
+
+                    ml_features = None
+                    if is_entry_candidate:
+                        ml_features = self.extract_rf_features(
+                            symbol,
+                            trade_date,
+                            bar_idx,
+                            day_bars,
+                            prev_closes[symbol],
+                            candidate_direction=base_signal,
                         )
 
-                        if rf_features is not None:
-                            # Get RF prediction and confidence
-                            rf_signal_str, rf_confidence = self.get_rf_signal(rf_features)
+                        if (
+                            self.ml_train_on_all_candidates
+                            and ml_features is not None
+                            and candidate_source is not None
+                        ):
+                            _, exit_price, exit_timestamp = self._simulate_candidate_exit(
+                                symbol=symbol,
+                                day_bars=day_bars,
+                                entry_idx=bar_idx,
+                                direction=base_signal,
+                                candidate_source=candidate_source,
+                                upper_bounds=upper_bounds,
+                                lower_bounds=lower_bounds,
+                                vwap_prices=vwap_prices,
+                                close_prices=close_prices,
+                                minutes=minutes,
+                            )
+                            day_ml_training_samples.append({
+                                'features': ml_features,
+                                'entry_price': float(current_price),
+                                'exit_price': float(exit_price),
+                                'signal': 'BUY' if base_signal > 0 else 'SHORT',
+                                'timestamp': exit_timestamp,
+                            })
 
-                            # Only take LONG signals if RF agrees and is confident
-                            if base_signal == 1:  # Want to go LONG
-                                if rf_signal_str == 'BUY' and rf_confidence >= self.rf_confidence_threshold:
-                                    final_signal = 1  # RF confirms: take the trade
-                                else:
-                                    final_signal = 0  # RF blocks: skip this trade
+                    if ml_model_name is not None and is_entry_candidate and ml_model_ready:
+                        # Use the already-extracted features for this candidate signal
 
-                            # For SHORT signals, we also check RF (but RF only predicts BUY/HOLD)
-                            # If base wants SHORT but RF says BUY, that's a strong conflict - block it
-                            elif base_signal == -1:  # Want to go SHORT
-                                if rf_signal_str == 'BUY' and rf_confidence >= self.rf_confidence_threshold:
-                                    final_signal = 0  # RF strongly disagrees: block SHORT
-                                else:
-                                    final_signal = -1  # RF doesn't object: allow SHORT
+                        if ml_features is not None:
+                            self.ml_gate_stats['gated_candidates'] += 1
 
-                    # Commit the final signal (after RF filtering)
+                            shadow_decisions = self._record_shadow_model_decisions(ml_features)
+
+                            # Get active ML model prediction and confidence
+                            if self.ml_mode == 'rf':
+                                active_decision = shadow_decisions.get('rf')
+                            elif self.ml_mode == 'lgbm':
+                                active_decision = shadow_decisions.get('lgbm')
+                            elif self.ml_mode == 'xgb':
+                                active_decision = shadow_decisions.get('xgb')
+                            elif self.ml_mode == 'ensemble':
+                                ml_signal_str, ml_confidence = self.get_ml_signal(ml_features)
+                                active_decision = {
+                                    'signal': ml_signal_str,
+                                    'confidence': ml_confidence,
+                                }
+                            else:
+                                active_decision = None
+
+                            if active_decision is None:
+                                ml_signal_str, ml_confidence = self.get_ml_signal(ml_features)
+                            else:
+                                ml_signal_str = active_decision['signal']
+                                ml_confidence = active_decision['confidence']
+
+                            ml_threshold = self._active_ml_confidence_threshold()
+                            self.ml_gate_stats['active_confidence_sum'] += ml_confidence
+
+                            if ml_signal_str == 'TRADE' and ml_confidence >= ml_threshold:
+                                final_signal = base_signal
+                                self.ml_gate_stats['active_approved'] += 1
+                            else:
+                                final_signal = 0
+                                self.ml_gate_stats['active_blocked'] += 1
+                        else:
+                            self.ml_gate_stats['feature_passthrough'] += 1
+
+                    if is_trade_bar:
+                        commanded_position = final_signal
+
+                        if candidate_intraday_exit and final_signal == 0 and symbol in self.intraday_positions:
+                            del self.intraday_positions[symbol]
+                        elif candidate_intraday_entry is not None and final_signal == candidate_intraday_entry['direction']:
+                            self.intraday_positions[symbol] = candidate_intraday_entry
+
+                        if candidate_gap_exit and final_signal == 0 and symbol in self.gap_positions:
+                            del self.gap_positions[symbol]
+                        elif candidate_gap_entry is not None and final_signal == candidate_gap_entry['direction']:
+                            self.gap_positions[symbol] = candidate_gap_entry
+
+                    # Commit the final signal after ML gating
                     signals[bar_idx] = final_signal
 
                 # Only trade at trade_freq intervals after first 30 min
@@ -3308,6 +4566,20 @@ class StrategyBacktester:
                     filled_exposure.append(last_valid)
                 exposure = pd.Series(filled_exposure).shift(1).fillna(0).values
 
+                # EVENT FILTER (opt-in via bt.use_event_filter = True): stay FLAT during
+                # the scheduled-event windows shown harmful in event_filter_test.py —
+                # per-symbol earnings + quad-witch (all day), FOMC afternoon (>=14:00 ET,
+                # minute 270). CPI/NFP are deliberately NOT blocked (CPI was the book's
+                # best event day). Mirrors event_calendar.should_block_entry; here applied
+                # as flat-during-window (for earnings that's the point — don't hold the gap).
+                if getattr(self, 'use_event_filter', False):
+                    import event_calendar as _ec
+                    if _ec.is_quad_witch(trade_date) or any(
+                            _ec._to_date(s) == trade_date for s in _ec.EARNINGS_DATES.get(symbol, [])):
+                        exposure[:] = 0.0                       # earnings / quad-witch: flat all day
+                    elif _ec.is_fomc_day(trade_date):
+                        exposure[minutes >= 270] = 0.0          # FOMC: flat from 14:00 ET
+
                 # ============================================================
                 # PAPER'S METHOD: Minute-by-Minute P&L Calculation
                 # Calculate position size ONCE per day (not per bar)
@@ -3318,8 +4590,13 @@ class StrategyBacktester:
                 else:
                     vol_scalar = 1.0
 
+                # Gamma-imbalance multiplier (paper §4.5): low prior-day RSI → boost,
+                # high RSI → cut. Multiplicative on the paper's vol-targeted size.
+                rsi_prev = self._compute_prev_day_rsi5(symbol, trade_date)
+                rsi_mult = self._rsi_gamma_multiplier(rsi_prev)
+
                 # Position size based on day's open price (paper spec)
-                shares = int((capital * self.allocations[symbol]) / open_prices[symbol] * vol_scalar)
+                shares = int((capital * self.allocations[symbol]) / open_prices[symbol] * vol_scalar * rsi_mult)
                 
                 if shares > 0:
                     # Calculate minute-by-minute price changes
@@ -3332,44 +4609,59 @@ class StrategyBacktester:
                     # If exposure[i] = 0: no P&L
                     minute_pnl = exposure * price_changes * shares
 
-                    # Count trades (number of exposure changes)
-                    exposure_with_final_zero = np.append(exposure, 0)
-                    exposure_changes = np.diff(exposure_with_final_zero)
-                    trades_count = np.sum(np.abs(exposure_changes))
+                    # Exposure changes occur at the close of each trade-point
+                    # bar.  A reversal has magnitude two and therefore trades
+                    # twice the base share count.
+                    execution_orders = self._exposure_change_orders(
+                        exposure,
+                        close_prices,
+                    )
+                    trades_count = sum(
+                        abs(exposure_change)
+                        for _, exposure_change, _ in execution_orders
+                    )
 
-                    # Calculate transaction costs (paper spec)
-                    min_commission = 0.35  # Minimum $0.35 per order
-                    commission_per_trade = max(self.commission_per_share * shares, min_commission)
-                    total_commission = trades_count * commission_per_trade
+                    execution_estimates = {}
+                    total_commission = 0.0
+                    total_spread = 0.0
+                    total_slippage = 0.0
+                    total_impact = 0.0
+                    for trade_idx, exposure_change, trade_price in execution_orders:
+                        share_change = abs(exposure_change) * shares
+                        estimate = self.apply_transaction_costs(
+                            trade_price,
+                            share_change,
+                            return_estimate=True,
+                        )
+                        execution_estimates[trade_idx] = estimate
+                        total_commission += estimate.commission
+                        total_spread += estimate.spread
+                        total_slippage += estimate.slippage
+                        total_impact += estimate.impact
 
-                    # Slippage: flat $0.001 per share per trade (paper spec)
-                    slippage_per_trade = 0.001 * shares
-                    total_slippage = trades_count * slippage_per_trade
+                    total_transaction_cost = (
+                        total_commission + total_spread + total_slippage + total_impact
+                    )
 
                     # Net P&L for the day
                     gross_pnl = np.sum(minute_pnl)
-                    net_pnl = gross_pnl - total_commission - total_slippage
+                    net_pnl = gross_pnl - total_transaction_cost
                     daily_pnl += net_pnl
 
                     # Record trades for reporting
                     if trades_count > 0:
-                        # Find all trade points (where exposure changes)
-                        trade_indices = np.where(exposure_changes != 0)[0]
-                        
-                        for trade_idx in trade_indices:
-                            if trade_idx >= len(day_bars):
-                                continue
-                                
+                        for trade_idx, exposure_change, trade_price in execution_orders:
                             bar = day_bars.iloc[trade_idx]
-                            
+                            traded_shares = abs(exposure_change) * shares
+
                             # Determine action
-                            if trade_idx == 0:
-                                prev_exposure = 0
-                            else:
-                                prev_exposure = exposure[trade_idx - 1]
-                            
-                            curr_exposure = exposure[trade_idx]
-                            
+                            prev_exposure = exposure[trade_idx]
+                            curr_exposure = (
+                                exposure[trade_idx + 1]
+                                if trade_idx + 1 < len(exposure)
+                                else 0
+                            )
+
                             if prev_exposure == 0 and curr_exposure > 0:
                                 action = 'BUY'
                             elif prev_exposure == 0 and curr_exposure < 0:
@@ -3380,28 +4672,50 @@ class StrategyBacktester:
                                 action = 'COVER'
                             else:
                                 action = 'ADJUST'
-                            
-                            # Calculate individual trade P&L for this transition
-                            trade_pnl = net_pnl / trades_count if trades_count > 0 else 0
-                            
+
+                            # Allocate the daily P&L by one-way turnover so a
+                            # reversal receives twice the weight of an entry or
+                            # exit, matching its traded notional.
+                            trade_pnl = (
+                                net_pnl * abs(exposure_change) / trades_count
+                                if trades_count > 0 else 0
+                            )
+                            estimate = execution_estimates[trade_idx]
+
                             trades.append({
                                 'datetime': bar['datetime'],
                                 'date': trade_date,
                                 'symbol': symbol,
                                 'action': action,
-                                'price': bar['close'],
-                                'shares': shares,
-                                'pnl': trade_pnl
+                                'price': trade_price,
+                                'shares': traded_shares,
+                                'position_shares': shares,
+                                'exposure_change': exposure_change,
+                                'pnl': trade_pnl,
+                                'commission': estimate.commission,
+                                'spread': estimate.spread,
+                                'slippage': estimate.slippage,
+                                'impact': estimate.impact,
+                                'transaction_cost': estimate.total,
                             })
                             
-                            # RF Training: Track entry trades for outcome prediction
-                            if self.use_rf and action in ['BUY', 'SHORT']:
+                            # ML training: track executed entry trades when not using all-candidate training
+                            if (
+                                (self.use_rf or self.use_lgbm)
+                                and not self.ml_train_on_all_candidates
+                                and action in ['BUY', 'SHORT']
+                            ):
                                 # Extract features at entry point
-                                rf_features = self.extract_rf_features(
-                                    symbol, trade_date, trade_idx, day_bars, prev_closes[symbol]
+                                ml_features = self.extract_rf_features(
+                                    symbol,
+                                    trade_date,
+                                    trade_idx,
+                                    day_bars,
+                                    prev_closes[symbol],
+                                    candidate_direction=(1 if action == 'BUY' else -1),
                                 )
                                 
-                                if rf_features:
+                                if ml_features:
                                     # Find the corresponding exit
                                     exit_idx = trade_idx + 1
                                     while exit_idx < len(exposure) and exposure[exit_idx] == curr_exposure:
@@ -3413,7 +4727,7 @@ class StrategyBacktester:
                                         
                                         # Record outcome
                                         self.record_trade_outcome(
-                                            rf_features, entry_price, exit_price, 
+                                            ml_features, entry_price, exit_price,
                                             action, bar['datetime']
                                         )
 
@@ -3426,14 +4740,31 @@ class StrategyBacktester:
                             'price': close_prices[-1],
                             'shares': shares,
                             'trades_count': int(trades_count),
+                            'orders_count': len(execution_orders),
                             'gross_pnl': gross_pnl,
-                            'net_pnl': net_pnl
+                            'net_pnl': net_pnl,
+                            'commission': total_commission,
+                            'spread': total_spread,
+                            'slippage': total_slippage,
+                            'impact': total_impact,
+                            'transaction_cost': total_transaction_cost,
                         })
 
                         # Log intraday trading activity
                         if trades_count > 0:
                             print(f"    [INTRADAY] {symbol}: {int(trades_count)} trades, "
                                   f"gross: ${gross_pnl:,.2f}, net: ${net_pnl:,.2f}")
+
+            if self.ml_train_on_all_candidates and day_ml_training_samples:
+                day_ml_training_samples.sort(key=lambda sample: pd.to_datetime(sample['timestamp']))
+                for sample in day_ml_training_samples:
+                    self.record_trade_outcome(
+                        sample['features'],
+                        sample['entry_price'],
+                        sample['exit_price'],
+                        sample['signal'],
+                        sample['timestamp'],
+                    )
 
             # Update capital with realized P&L
             capital += daily_pnl
@@ -3464,16 +4795,9 @@ class StrategyBacktester:
                     daily_return = (curr_val - prev_val) / prev_val
                     self.rolling_returns.append(daily_return)
 
-        # Calculate daily returns
-        daily_returns_list = []
-        for i in range(1, len(equity_curve)):
-            prev_val = equity_curve[i-1]['portfolio_value']
-            curr_val = equity_curve[i]['portfolio_value']
-            if prev_val > 0:
-                daily_returns_list.append((curr_val - prev_val) / prev_val)
-
         # Liquidate all swing positions at end of backtest
         final_swing_proceeds = 0
+        final_liquidation_cost = 0.0
         if self.swing_positions:
             print(f"\n  Liquidating {len(self.swing_positions)} open positions at backtest end...")
             for sym, pos in self.swing_positions.items():
@@ -3483,14 +4807,38 @@ class StrategyBacktester:
                         entry_price = pos['entry_price']
                         shares = pos['quantity']
                         exit_cost = self.apply_transaction_costs(exit_price, shares)
+                        entry_cost = float(pos.get('entry_transaction_cost', 0.0))
                         proceeds = shares * exit_price - exit_cost
-                        pnl = (exit_price - entry_price) * shares - exit_cost
+                        pnl = (
+                            (exit_price - entry_price) * shares
+                            - entry_cost
+                            - exit_cost
+                        )
                         final_swing_proceeds += proceeds
+                        final_liquidation_cost += exit_cost
                         print(f"    - {sym}: {shares} shares @ ${exit_price:.2f} (entry: ${entry_price:.2f}), PnL: ${pnl:,.2f}")
 
             # Add liquidation proceeds to capital
             capital += final_swing_proceeds
             self.swing_positions.clear()
+
+            # The final curve row already marks open swings at the same close.
+            # Reconcile it to post-liquidation cash so the exit cost included
+            # in the shared ledger is also included in return/Sharpe metrics.
+            if equity_curve:
+                equity_curve[-1]['portfolio_value'] = capital
+                equity_curve[-1]['capital'] = capital
+                equity_curve[-1]['swing_value'] = 0.0
+                equity_curve[-1]['daily_pnl'] -= final_liquidation_cost
+
+        # Calculate returns only after final liquidation has been reflected in
+        # the curve; otherwise the final execution fee is omitted from metrics.
+        daily_returns_list = []
+        for i in range(1, len(equity_curve)):
+            prev_val = equity_curve[i-1]['portfolio_value']
+            curr_val = equity_curve[i]['portfolio_value']
+            if prev_val > 0:
+                daily_returns_list.append((curr_val - prev_val) / prev_val)
 
         # Store results
         self.trades = pd.DataFrame(trades)
@@ -3500,6 +4848,58 @@ class StrategyBacktester:
         print(f"\n  Total trades: {len(trades)}")
         print(f"  Trading days: {len(trading_dates)}")
         print(f"  Final portfolio value (all positions closed): ${capital:,.2f}")
+
+        if ml_gate is not None:
+            ml_diag = self.get_ml_gate_diagnostics()
+            print("  ML Gate Diagnostics:")
+            print(
+                f"    Candidates: {ml_diag['base_candidates']} "
+                f"(long={ml_diag['long_candidates']}, short={ml_diag['short_candidates']})"
+            )
+            print(
+                f"    Gated: {ml_diag['gated_candidates']} "
+                f"({ml_diag['gate_ready_rate']:.1%} of candidates) | "
+                f"Warmup passthrough: {ml_diag['warmup_passthrough']} | "
+                f"Feature passthrough: {ml_diag['feature_passthrough']}"
+            )
+            print(
+                f"    Active approvals: {ml_diag['active_approved']} | "
+                f"Blocks: {ml_diag['active_blocked']} | "
+                f"Avg confidence: {ml_diag['active_avg_confidence']:.3f}"
+            )
+
+            if ml_diag['rf_shadow_evals'] > 0:
+                print(
+                    f"    RF shadow approvals: {ml_diag['rf_shadow_approved']}/"
+                    f"{ml_diag['rf_shadow_evals']} "
+                    f"({ml_diag['rf_shadow_approval_rate']:.1%}, "
+                    f"avg_conf={ml_diag['rf_shadow_avg_confidence']:.3f})"
+                )
+            if ml_diag['lgbm_shadow_evals'] > 0:
+                print(
+                    f"    LGBM shadow approvals: {ml_diag['lgbm_shadow_approved']}/"
+                    f"{ml_diag['lgbm_shadow_evals']} "
+                    f"({ml_diag['lgbm_shadow_approval_rate']:.1%}, "
+                    f"avg_conf={ml_diag['lgbm_shadow_avg_confidence']:.3f})"
+                )
+            if ml_diag['xgb_shadow_evals'] > 0:
+                print(
+                    f"    XGB shadow approvals: {ml_diag['xgb_shadow_approved']}/"
+                    f"{ml_diag['xgb_shadow_evals']} "
+                    f"({ml_diag['xgb_shadow_approval_rate']:.1%}, "
+                    f"avg_conf={ml_diag['xgb_shadow_avg_confidence']:.3f})"
+                )
+            if ml_diag['dual_model_evals'] > 0:
+                print(
+                    f"    RF/LGBM signal disagreements: {ml_diag['dual_model_signal_disagreements']}/"
+                    f"{ml_diag['dual_model_evals']} "
+                    f"({ml_diag['dual_model_signal_disagreement_rate']:.1%})"
+                )
+                print(
+                    f"    RF/LGBM approval disagreements: {ml_diag['dual_model_approval_disagreements']}/"
+                    f"{ml_diag['dual_model_evals']} "
+                    f"({ml_diag['dual_model_approval_disagreement_rate']:.1%})"
+                )
 
         return self.equity_curve
 
@@ -3636,6 +5036,18 @@ class StrategyBacktester:
             'avg_win': avg_win,
             'avg_loss': avg_loss,
             'total_trades': len(self.trades),
+            'execution_notional': self.execution_cost_totals['notional'],
+            'commission_cost': self.execution_cost_totals['commission'],
+            'spread_cost': self.execution_cost_totals['spread'],
+            'slippage_cost': self.execution_cost_totals['slippage'],
+            'impact_cost': self.execution_cost_totals['impact'],
+            'total_execution_cost': self.execution_cost_totals['total'],
+            'execution_cost_bps': (
+                self.execution_cost_totals['total']
+                / self.execution_cost_totals['notional']
+                * 10000.0
+                if self.execution_cost_totals['notional'] > 0 else 0.0
+            ),
             't_statistic': t_stat,
             'p_value': p_value,
             'statistically_significant': p_value < 0.05
@@ -4382,13 +5794,435 @@ def run_parameter_sensitivity(
     return df
 
 
+ML_COMPARE_PERFORMANCE_COLUMNS = [
+    'final_value',
+    'total_return_pct',
+    'sharpe_ratio',
+    'max_drawdown_pct',
+    'win_rate_pct',
+    'total_trades',
+]
+
+ML_COMPARE_DIAGNOSTIC_COLUMNS = [
+    'candidate_signals',
+    'gated_candidates',
+    'warmup_passthrough',
+    'active_approved',
+    'active_blocked',
+    'rf_shadow_approved',
+    'lgbm_shadow_approved',
+    'xgb_shadow_approved',
+    'rf_lgbm_approval_disagreement_pct',
+]
+
+ML_COMPARE_INTEGER_ROWS = {
+    'total_trades',
+    'candidate_signals',
+    'gated_candidates',
+    'warmup_passthrough',
+    'active_approved',
+    'active_blocked',
+    'rf_shadow_approved',
+    'lgbm_shadow_approved',
+    'xgb_shadow_approved',
+}
+
+ML_COMPARE_DECIMALS = {
+    'final_value': 2,
+    'total_return_pct': 2,
+    'sharpe_ratio': 2,
+    'max_drawdown_pct': 2,
+    'win_rate_pct': 2,
+    'rf_lgbm_approval_disagreement_pct': 2,
+}
+
+
+def _transpose_ml_compare_table(comparison_df: pd.DataFrame, columns: list) -> pd.DataFrame:
+    """Return a metric-by-mode table for easier side-by-side review."""
+    available_columns = [col for col in columns if col in comparison_df.columns]
+    table = comparison_df.set_index('mode')[available_columns].T
+    table.index.name = 'metric'
+    return table
+
+
+def _format_ml_compare_value(metric: str, value) -> str:
+    """Format one comparison value for compact console/HTML display."""
+    if pd.isna(value):
+        return ''
+    if metric in ML_COMPARE_INTEGER_ROWS:
+        return f"{int(round(float(value))):,}"
+    decimals = ML_COMPARE_DECIMALS.get(metric, 2)
+    if metric == 'final_value':
+        return f"{float(value):,.{decimals}f}"
+    return f"{float(value):.{decimals}f}"
+
+
+def _format_ml_compare_table(table: pd.DataFrame) -> pd.DataFrame:
+    """Format a transposed comparison table as strings."""
+    formatted = table.copy()
+    for metric in formatted.index:
+        formatted.loc[metric] = formatted.loc[metric].map(
+            lambda value: _format_ml_compare_value(metric, value)
+        )
+    return formatted
+
+
+def _style_ml_compare_sheet(ws, metric_rows: set):
+    """Apply simple workbook formatting without changing values."""
+    try:
+        from openpyxl.styles import Alignment, Font, PatternFill
+    except ImportError:
+        return
+
+    header_fill = PatternFill('solid', fgColor='1F4E78')
+    header_font = Font(color='FFFFFF', bold=True)
+    row_fill = PatternFill('solid', fgColor='D9EAF7')
+
+    ws.freeze_panes = 'B2'
+    ws.auto_filter.ref = ws.dimensions
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center')
+
+    for row in range(2, ws.max_row + 1):
+        metric = ws.cell(row=row, column=1).value
+        ws.cell(row=row, column=1).fill = row_fill
+        ws.cell(row=row, column=1).font = Font(bold=True)
+        number_format = '#,##0' if metric in metric_rows else '#,##0.00'
+        for col in range(2, ws.max_column + 1):
+            ws.cell(row=row, column=col).number_format = number_format
+
+    ws.column_dimensions['A'].width = 34
+    for col_idx in range(2, ws.max_column + 1):
+        column_letter = ws.cell(row=1, column=col_idx).column_letter
+        ws.column_dimensions[column_letter].width = 14
+
+
+def _write_ml_compare_xlsx(
+    xlsx_path: str,
+    performance_table: pd.DataFrame,
+    diagnostic_table: pd.DataFrame,
+    comparison_df: pd.DataFrame,
+):
+    """Write Excel workbook with review-friendly tabs."""
+    with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+        performance_table.to_excel(writer, sheet_name='Performance')
+        diagnostic_table.to_excel(writer, sheet_name='Gate Diagnostics')
+        comparison_df.to_excel(writer, sheet_name='Raw Results', index=False)
+
+        _style_ml_compare_sheet(
+            writer.book['Performance'],
+            ML_COMPARE_INTEGER_ROWS,
+        )
+        _style_ml_compare_sheet(
+            writer.book['Gate Diagnostics'],
+            ML_COMPARE_INTEGER_ROWS,
+        )
+
+        raw_ws = writer.book['Raw Results']
+        raw_ws.freeze_panes = 'A2'
+        raw_ws.auto_filter.ref = raw_ws.dimensions
+        for cell in raw_ws[1]:
+            try:
+                from openpyxl.styles import Alignment, Font, PatternFill
+                cell.fill = PatternFill('solid', fgColor='1F4E78')
+                cell.font = Font(color='FFFFFF', bold=True)
+                cell.alignment = Alignment(horizontal='center')
+            except ImportError:
+                break
+        for col_idx in range(1, raw_ws.max_column + 1):
+            column_letter = raw_ws.cell(row=1, column=col_idx).column_letter
+            raw_ws.column_dimensions[column_letter].width = 18
+
+
+def _write_ml_compare_html(
+    html_path: str,
+    performance_table: pd.DataFrame,
+    diagnostic_table: pd.DataFrame,
+):
+    """Write a compact standalone HTML report."""
+    performance_html = _format_ml_compare_table(performance_table).to_html(
+        classes='report-table',
+        border=0,
+        escape=True,
+    )
+    diagnostic_html = _format_ml_compare_table(diagnostic_table).to_html(
+        classes='report-table',
+        border=0,
+        escape=True,
+    )
+    generated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ML Mode Comparison</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --text: #18212f;
+      --muted: #667085;
+      --line: #d8dee9;
+      --header: #1f4e78;
+      --header-text: #ffffff;
+      --row-head: #edf5fb;
+    }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      max-width: 1040px;
+      margin: 28px auto;
+      padding: 0 20px 32px;
+    }}
+    h1 {{
+      margin: 0 0 4px;
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }}
+    .timestamp {{
+      margin: 0 0 24px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    section {{
+      margin: 0 0 24px;
+      padding: 18px 20px 20px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    h2 {{
+      margin: 0 0 14px;
+      font-size: 18px;
+      letter-spacing: 0;
+    }}
+    .table-wrap {{
+      overflow-x: auto;
+    }}
+    table.report-table {{
+      border-collapse: collapse;
+      min-width: 620px;
+      width: 100%;
+    }}
+    .report-table th,
+    .report-table td {{
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      text-align: right;
+      white-space: nowrap;
+    }}
+    .report-table thead th {{
+      background: var(--header);
+      color: var(--header-text);
+      font-weight: 700;
+      text-align: right;
+    }}
+    .report-table thead th:first-child,
+    .report-table tbody th {{
+      text-align: left;
+    }}
+    .report-table tbody th {{
+      background: var(--row-head);
+      font-weight: 650;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ML Mode Comparison</h1>
+    <p class="timestamp">Generated {generated_at}</p>
+    <section>
+      <h2>Performance</h2>
+      <div class="table-wrap">
+        {performance_html}
+      </div>
+    </section>
+    <section>
+      <h2>Gate Diagnostics</h2>
+      <div class="table-wrap">
+        {diagnostic_html}
+      </div>
+    </section>
+  </main>
+</body>
+</html>
+"""
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+
+
+def _write_ml_compare_reports(
+    comparison_df: pd.DataFrame,
+    report_dir: str,
+    report_basename: str,
+    performance_table: pd.DataFrame,
+    diagnostic_table: pd.DataFrame,
+) -> dict:
+    """Write comparison artifacts and return successful paths."""
+    os.makedirs(report_dir, exist_ok=True)
+    paths = {
+        'xlsx': os.path.abspath(os.path.join(report_dir, f'{report_basename}.xlsx')),
+        'html': os.path.abspath(os.path.join(report_dir, f'{report_basename}.html')),
+    }
+    written_paths = {}
+
+    try:
+        _write_ml_compare_xlsx(
+            paths['xlsx'],
+            performance_table,
+            diagnostic_table,
+            comparison_df,
+        )
+        written_paths['xlsx'] = paths['xlsx']
+    except Exception as exc:
+        print(f"Warning: could not write Excel report: {exc}")
+
+    try:
+        _write_ml_compare_html(
+            paths['html'],
+            performance_table,
+            diagnostic_table,
+        )
+        written_paths['html'] = paths['html']
+    except Exception as exc:
+        print(f"Warning: could not write HTML report: {exc}")
+
+    return written_paths
+
+
+def compare_ml_modes(
+    symbols: list,
+    start_date: str,
+    end_date: str,
+    modes: list | None = None,
+    long_only: bool = False,
+    data_dir: str = None,
+    write_reports: bool = True,
+    report_dir: str = None,
+    report_basename: str = 'ml_compare',
+    **backtester_kwargs
+) -> pd.DataFrame:
+    """
+    Run the same backtest across multiple ML gate modes.
+
+    Example:
+        compare_ml_modes(
+            symbols=['SPY', 'QQQ'],
+            start_date='2025-01-01',
+            end_date='2025-12-31',
+            modes=['rf', 'lgbm', 'ensemble'],
+            long_only=False,
+            vix_min=17,
+            use_swing=False
+        )
+    """
+    if modes is None:
+        modes = ['rf', 'lgbm']
+        if HAS_XGBOOST:
+            modes.append('xgb')
+        modes.append('ensemble')
+
+    print("\n" + "=" * 70)
+    print("ML MODE COMPARISON")
+    print("=" * 70)
+
+    comparison_rows = []
+
+    for mode in modes:
+        print(f"\nRunning mode='{mode}'...")
+        bt = StrategyBacktester(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            ml_mode=mode,
+            **backtester_kwargs
+        )
+        bt.load_from_csv(data_dir=data_dir)
+        bt.run_backtest(long_only=long_only)
+        metrics = bt.calculate_metrics() or {}
+        ml_diag = bt.get_ml_gate_diagnostics()
+
+        final_value = bt.equity_curve['portfolio_value'].iloc[-1] if len(bt.equity_curve) > 0 else bt.initial_capital
+        comparison_rows.append({
+            'mode': mode,
+            'final_value': final_value,
+            'total_return_pct': metrics.get('total_return', 0) * 100,
+            'sharpe_ratio': metrics.get('sharpe_ratio', 0),
+            'max_drawdown_pct': metrics.get('max_drawdown', 0) * 100,
+            'win_rate_pct': metrics.get('win_rate', 0) * 100,
+            'total_trades': metrics.get('total_trades', 0),
+            'candidate_signals': ml_diag.get('base_candidates', 0),
+            'gated_candidates': ml_diag.get('gated_candidates', 0),
+            'warmup_passthrough': ml_diag.get('warmup_passthrough', 0),
+            'active_approved': ml_diag.get('active_approved', 0),
+            'active_blocked': ml_diag.get('active_blocked', 0),
+            'rf_shadow_approved': ml_diag.get('rf_shadow_approved', 0),
+            'lgbm_shadow_approved': ml_diag.get('lgbm_shadow_approved', 0),
+            'xgb_shadow_approved': ml_diag.get('xgb_shadow_approved', 0),
+            'rf_lgbm_approval_disagreement_pct': (
+                ml_diag.get('dual_model_approval_disagreement_rate', 0.0) * 100
+            ),
+        })
+
+    comparison_df = pd.DataFrame(comparison_rows)
+
+    if not comparison_df.empty:
+        performance_table = _transpose_ml_compare_table(
+            comparison_df,
+            ML_COMPARE_PERFORMANCE_COLUMNS,
+        )
+        diagnostic_table = _transpose_ml_compare_table(
+            comparison_df,
+            ML_COMPARE_DIAGNOSTIC_COLUMNS,
+        )
+
+        print("\n" + "-" * 70)
+        print("PERFORMANCE")
+        print("-" * 70)
+        print(_format_ml_compare_table(performance_table).to_string())
+
+        print("\n" + "-" * 70)
+        print("ML GATE DIAGNOSTICS")
+        print("-" * 70)
+        print(_format_ml_compare_table(diagnostic_table).to_string())
+
+        if write_reports:
+            if report_dir is None:
+                report_dir = os.getcwd()
+            report_paths = _write_ml_compare_reports(
+                comparison_df=comparison_df,
+                report_dir=report_dir,
+                report_basename=report_basename,
+                performance_table=performance_table,
+                diagnostic_table=diagnostic_table,
+            )
+            comparison_df.attrs['report_paths'] = report_paths
+
+            if report_paths:
+                print("\nReports written:")
+                for report_type, report_path in report_paths.items():
+                    print(f"  {report_type}: {report_path}")
+
+    return comparison_df
+
+
 # ============================================================
 # MAIN EXECUTION
 # ============================================================
 
 if __name__ == "__main__":
     # Index ETFs only - intraday momentum is a market-wide effect
-    SYMBOLS = ['NVDA']
+    SYMBOLS = ['SPY', 'QQQ', 'IWM','NVDA', 'JPM', 'GOOG', 'WMT', 'AAPL', 'MSFT', 'META', 'UNH', 'XOM']  # ETFs + stocks
 
     # Check if IBKR CSV data exists (prefer 1m, fall back to 15m)
     CSV_EXISTS = (

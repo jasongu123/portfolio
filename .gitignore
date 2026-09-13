@@ -1,0 +1,34 @@
+# Secrets
+.env
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.venv/
+
+# Local data, caches, model pickles, bundles
+*.pkl
+*.db
+*.zip
+*.csv
+*.parquet
+*_1m.csv
+*_1min.csv
+data_lake/
+results/
+backtest_data/
+backtest_cache/
+screenshots/
+
+# Build output
+build/
+*.o
+european_option
+
+# OS / editor
+.DS_Store
+.vscode/
