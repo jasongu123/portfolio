@@ -22,8 +22,9 @@ they depend on are here.
 
 `docs/PORTFOLIO.md` is the overview: architecture, the validated book, results, and known limits.
 
-The research trail that produced these choices, including the candidates that were tried and
-rejected, is not part of this repository.
+The research trail that produced these choices is in [`research/`](research/README.md): a project
+summary, the registry of 97 pre-registered trials (most of them failures, each with its likely
+cause), one write-up per study, and the research scripts.
 
 ## Running
 
