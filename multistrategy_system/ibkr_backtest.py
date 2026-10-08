@@ -998,6 +998,7 @@ class StrategyBacktester:
         start_date: str,
         end_date: str,
         initial_capital: float = 100000,
+        warmup_days: int = 120,  # calendar days of history loaded before start_date (audit item 7)
         # Strategy parameters (matching Zarattini paper)
         lag: int = 14,
         target_vol: float = 0.02,  # Paper: 2% daily target volatility
@@ -1034,6 +1035,8 @@ class StrategyBacktester:
         ensemble_xgb_weight: float = 0.0,
         ml_profit_target_pct: float = 0.001,
         ml_train_on_all_candidates: bool = True,
+        gate_model_factory=None,  # optional callable(class_weight) -> unfitted classifier for the rf-mode gate
+        gate_calibration: str = None,  # optional 'sigmoid' / 'isotonic' calibration on the walk-forward validation slice
         # VIX filter: only trade ETFs when VIX is above minimum (paper says higher VIX = better)
         # NOTE: This filter only applies to ETFs. Stocks trade regardless of VIX level.
         vix_min: float = 17,  # Minimum VIX to trade ETFs
@@ -1088,6 +1091,7 @@ class StrategyBacktester:
         use_stock_vol_regime: bool = True,  # Use stock's own vol instead of VIX
         vol_momentum_threshold: float = 0.2,  # Vol rank threshold to switch momentum (20% above avg)
         vol_lookback: int = 20,  # Days for stock vol calculation
+        vix_gate_mode: str = None,  # 'prior_close' (default) or 'intraday' (needs VIX_1m.csv)
     ):
         self.symbols = symbols
         self.start_date = start_date
@@ -1179,6 +1183,10 @@ class StrategyBacktester:
         self.ensemble_xgb_weight = ensemble_xgb_weight
         self.ml_profit_target_pct = ml_profit_target_pct
         self.ml_train_on_all_candidates = ml_train_on_all_candidates
+        # Gate-model trial hooks (GATE_TRIAL.md). With both None the rf gate is exactly the
+        # original RandomForestClassifier path.
+        self.gate_model_factory = gate_model_factory
+        self.gate_calibration = gate_calibration
 
         # VALIDATED 33-feature set — backtested at +10.27% / Sharpe 1.16 (2025).
         # MUST stay identical (names + order) to ibkr2.py rf_feature_names.
@@ -1214,6 +1222,9 @@ class StrategyBacktester:
         self.vix_min = vix_min
         self.vix_max = vix_max  # Max VIX for bucket analysis
         self.vix_data = {}  # {date: vix_close}
+        # {date: (bar-start times as int64 ns, closes)} from backtest_data/VIX_1m.csv
+        self.vix_intraday = {}
+        self.vix_gate_mode = vix_gate_mode or self.DEFAULT_VIX_GATE_MODE
         
         # Danger zone parameters (VIX 15-17 is historically toxic)
         self.skip_danger_zone = skip_danger_zone
@@ -1275,6 +1286,7 @@ class StrategyBacktester:
         self.intraday_sigma_cache = {}  # {symbol: {date_str: {minute: sigma}}} - PRE-COMPUTED
         # HAR forecasting
         self.use_har_forecast = use_har_forecast
+        self.warmup_days = warmup_days
         self.har_refit_frequency = har_refit_frequency
         self.har_forecaster = {}  # {symbol: ZarattiniSigmaForecaster()}
         self.har_sigma_history = {}  # {symbol: [daily_sigmas]}
@@ -1776,11 +1788,15 @@ class StrategyBacktester:
         for symbol in list(self.data.keys()):
             intraday = self.data[symbol]['intraday']
 
-            # Filter intraday to date range
+            # Filter intraday to date range, keeping a warm-up before the start so the noise
+            # bands, daily vol, monthly allocations and HAR history are computed from real
+            # history on the first trading day. run_backtest still trades only start..end.
+            # (Audit fix 2026-10-01, item 7; warmup_days=0 restores the old cold start.)
             start_date = pd.to_datetime(self.start_date).date()
             end_date = pd.to_datetime(self.end_date).date()
+            load_start = start_date - timedelta(days=int(getattr(self, 'warmup_days', 0) or 0))
 
-            mask = (intraday['date'] >= start_date) & (intraday['date'] <= end_date)
+            mask = (intraday['date'] >= load_start) & (intraday['date'] <= end_date)
             self.data[symbol]['intraday'] = intraday[mask].copy()
 
             print(f"  {symbol}: Filtered to {len(self.data[symbol]['intraday'])} bars "
@@ -1796,6 +1812,19 @@ class StrategyBacktester:
             print(f"  VIX: Loaded {len(self.vix_data)} days")
         else:
             print(f"  Warning: No VIX data found at {vix_file}")
+
+        vix_1m_file = os.path.join(data_dir or DATA_DIR, 'VIX_1m.csv')
+        self.vix_intraday = {}
+        if os.path.exists(vix_1m_file):
+            v1 = pd.read_csv(vix_1m_file, usecols=['date', 'close'], parse_dates=['date'])
+            v1 = v1.sort_values('date')
+            for d, g in v1.groupby(v1['date'].dt.date):
+                self.vix_intraday[d] = (g['date'].values.astype('datetime64[ns]').astype(np.int64),
+                                        g['close'].to_numpy(dtype=float))
+            print(f"  VIX 1-min: Loaded {len(self.vix_intraday)} days")
+        if self.vix_gate_mode == 'intraday' and not self.vix_intraday:
+            print(f"  Warning: vix_gate_mode='intraday' but no {vix_1m_file}; "
+                  f"the ETF gate uses the prior day's close")
             print(f"  To extract VIX: python -c \"from ibkr_backtest import extract_vix_data; extract_vix_data()\"")
 
         # Phase B: load auxiliary index data (VIX9D/VIX3M/VVIX/DXY/TNX) used as
@@ -1893,7 +1922,9 @@ class StrategyBacktester:
                     # Rolling daily volatility (dvol) over lag days
                     # Paper uses 15 days (d-15:d-1), excluding current day for walk-forward validation
                     if d > 14:  # Need at least 15 days of history
-                        recent_days = all_days[d - 15:d - 1]  # 14 days of returns, excluding today
+                        # Audit fix 2026-10-01 (item 10): the 14 returns ending YESTERDAY (was d-15:d-1,
+                        # which ended the day before yesterday).
+                        recent_days = all_days[d - 14:d]  # 14 days of returns, excluding today
                         recent_returns = [self.daily_returns[symbol].get(day, 0) for day in recent_days
                                           if day in self.daily_returns[symbol]]
                         if len(recent_returns) >= 14:
@@ -2193,6 +2224,59 @@ class StrategyBacktester:
         # Triple witching is 3rd Friday of Mar, Jun, Sep, Dec
         return True
     
+    # A daily close is looked up at most this many calendar days before the trade
+    # date: the prior day plus ibkr2.py's 7-day walk back (_prior_index_close).
+    PRIOR_CLOSE_MAX_GAP_DAYS = 8
+
+    @classmethod
+    def _prior_daily_close(cls, series_map, trade_date, default=None):
+        """Close of the latest date strictly before `trade_date` in {date: close}.
+
+        A daily close is printed after the session (VIX at 16:15 ET), so the trade
+        date's own close is future data for every intraday decision that day.
+        Same rule as ibkr2.py's _prior_index_close, so ML features match live.
+        """
+        if not series_map:
+            return default
+        if isinstance(trade_date, datetime):  # includes pd.Timestamp
+            trade_date = trade_date.date()
+        for back in range(1, cls.PRIOR_CLOSE_MAX_GAP_DAYS + 1):
+            value = series_map.get(trade_date - timedelta(days=back))
+            if value is not None:
+                return float(value)
+        return default
+
+    def _prior_vix(self, trade_date, default=None):
+        """Prior trading day's VIX close: what is known before the open of `trade_date`."""
+        return self._prior_daily_close(self.vix_data, trade_date, default)
+
+    # 'prior_close': the ETF gate uses the prior day's VIX close for the whole day
+    # (causal, but blind to intraday moves). 'intraday': it uses the VIX at each
+    # decision minute, as the live gate does (get_current_vix at every signal);
+    # days without 1-min VIX fall back to the prior close.
+    # Default since 2026-09-24 (headline): 'intraday', falling back to the prior close
+    # when backtest_data/VIX_1m.csv is absent or does not cover a day.
+    DEFAULT_VIX_GATE_MODE = 'intraday'
+
+    @staticmethod
+    def _vix_at(day_series, bar_time):
+        """Close of the latest 1-min VIX bar whose start is at or before `bar_time`.
+        Both that bar and the equity bar labelled `bar_time` close at the same instant."""
+        times, closes = day_series
+        t = np.datetime64(pd.Timestamp(bar_time).to_datetime64(), 'ns').astype(np.int64)
+        i = int(np.searchsorted(times, t, side='right')) - 1
+        return float(closes[i]) if i >= 0 else None
+
+    def _etf_vix_gate_open(self, vix, vix_min):
+        """The day-level ETF gate's VIX rules applied to one VIX reading."""
+        if vix_min is not None and (vix is None or vix < vix_min):
+            return False
+        if vix is not None and self.vix_max is not None and vix >= self.vix_max:
+            return False
+        if vix is not None and self.skip_danger_zone and self.danger_zone_min <= vix < self.danger_zone_max:
+            return False
+        return True
+
     def _get_adaptive_params(self, trade_date):
         """
         Get lookback and VM based on VIX regime.
@@ -2203,8 +2287,8 @@ class StrategyBacktester:
         if not self.use_vix_adaptive:
             return self.lag, self.volatility_multiplier
         
-        # Get VIX for this date
-        vix = self.vix_data.get(trade_date, 15.0)
+        # Prior day's VIX (the trade date's close is not known intraday)
+        vix = self._prior_vix(trade_date, 15.0)
         
         # Determine regime
         regime_map = self.vix_regimes[self.vix_adaptive_mode]
@@ -2335,7 +2419,8 @@ class StrategyBacktester:
             minutes_from_open = bar['minutes_from_open']
             bar_datetime = pd.to_datetime(bar['datetime'])
             is_etf_symbol = self.is_etf(symbol)
-            vix_level = float(self.vix_data.get(trade_date, 15.0))
+            # Prior day's close, as ibkr2.py _rf_vix_features (live and training)
+            vix_level = float(self._prior_vix(trade_date, 15.0))
 
             price_vs_open = (current_price / open_price) - 1 if open_price > 0 else 0.0
             price_vs_vwap = (current_price / current_vwap) - 1 if current_vwap > 0 else 0.0
@@ -2393,15 +2478,8 @@ class StrategyBacktester:
             aux = getattr(self, 'aux_index_data', {}) or {}
 
             def _prior_close(series_map, default):
-                """Most recent date <= trade_date in `series_map` (no look-ahead).
-                Uses < trade_date to be safe — VIX closing print is only known
-                after the close, so a same-day lookup would peek."""
-                if not series_map:
-                    return default
-                candidates = [d for d in series_map.keys() if d < trade_date]
-                if not candidates:
-                    return default
-                return float(series_map[max(candidates)])
+                """Latest close strictly before trade_date (no look-ahead)."""
+                return self._prior_daily_close(series_map, trade_date, default)
 
             vix_today  = float(vix_level) if vix_level else 15.0
             vix9d_val  = _prior_close(aux.get('VIX9D', {}), default=15.0)
@@ -2587,17 +2665,20 @@ class StrategyBacktester:
             self.rf_scaler.fit(X_train)
             X_train_scaled = self.rf_scaler.transform(X_train)
 
-            # Train RF
-            self.rf_model = RandomForestClassifier(
-                n_estimators=50,
-                max_depth=5,
-                min_samples_split=5,
-                min_samples_leaf=3,
-                random_state=42,
-                bootstrap=True,
-                oob_score=True,
-                class_weight=class_weight
-            )
+            # Train RF (or the trial's alternative gate model, same data and scaling)
+            if getattr(self, 'gate_model_factory', None) is not None:
+                self.rf_model = self.gate_model_factory(class_weight)
+            else:
+                self.rf_model = RandomForestClassifier(
+                    n_estimators=50,
+                    max_depth=5,
+                    min_samples_split=5,
+                    min_samples_leaf=3,
+                    random_state=42,
+                    bootstrap=True,
+                    oob_score=True,
+                    class_weight=class_weight
+                )
 
             self.rf_model.fit(X_train_scaled, y_train)
 
@@ -2611,6 +2692,16 @@ class StrategyBacktester:
                 if not hasattr(self, 'rf_val_scores'):
                     self.rf_val_scores = []
                 self.rf_val_scores.append(val_score)
+
+                # Optional probability calibration on the same held-out slice (after the
+                # score above, so the printed accuracy is not flattered by it).
+                calibration = getattr(self, 'gate_calibration', None)
+                if calibration and len(np.unique(y_val)) == 2:
+                    from sklearn.calibration import CalibratedClassifierCV
+                    from sklearn.frozen import FrozenEstimator
+                    calibrated = CalibratedClassifierCV(FrozenEstimator(self.rf_model), method=calibration)
+                    calibrated.fit(X_val_scaled, y_val)
+                    self.rf_model = calibrated
 
         except Exception as e:
             print(f"    Error training RF: {e}")
@@ -3464,13 +3555,20 @@ class StrategyBacktester:
 
         return True
 
-    def calculate_swing_position_size(self, symbol: str, current_price: float, capital: float) -> int:
-        """Calculate position size for swing trade using volatility targeting."""
+    def calculate_swing_position_size(self, symbol: str, current_price: float, capital: float,
+                                      trade_date=None) -> int:
+        """Calculate position size for swing trade using volatility targeting.
+
+        Audit fix 2026-10-01 (item 1): the volatility window ends before ``trade_date`` (as the
+        other swing helpers do); it used to be the last 20 rows of the whole daily file, i.e.
+        volatility from years after the trade."""
         # Get realized volatility (use daily returns std)
         if symbol not in self.data:
             return 0
 
         daily_df = self.data[symbol].get('daily')
+        if daily_df is not None and trade_date is not None:
+            daily_df = daily_df[daily_df['date'] < pd.Timestamp(trade_date)]
         if daily_df is None or len(daily_df) < 21:
             return 0
 
@@ -3703,6 +3801,37 @@ class StrategyBacktester:
             'total': 0.0,
         }
 
+    def _log_positions(self, symbol, trade_date, day_bars, exposure, minute_pnl,
+                       execution_orders, execution_estimates, src_open, shares):
+        """Opt-in (record_positions=True): one row per intraday position segment with the
+        candidate source that opened it, gross P&L and its share of execution costs.
+        Records only; the backtest's numbers are unchanged."""
+        log = self.__dict__.setdefault('position_log', [])
+        exposure = np.asarray(exposure, dtype=float)
+        unit_cost = {i: execution_estimates[i].total / abs(chg) for i, chg, _ in execution_orders if chg}
+        times = day_bars['datetime'].values
+        mins = day_bars['minutes_from_open'].values
+        closes = day_bars['close'].values
+        n = len(exposure)
+        j = 0
+        while j < n:
+            if exposure[j] == 0 or (j > 0 and exposure[j] == exposure[j - 1]):
+                j += 1
+                continue
+            k = j
+            while k < n and exposure[k] == exposure[j]:
+                k += 1
+            units = abs(exposure[j])
+            cost = units * (unit_cost.get(j - 1, 0.0) + unit_cost.get(k - 1, 0.0))
+            gross = float(np.sum(minute_pnl[j:k]))
+            log.append({'date': trade_date, 'symbol': symbol, 'source': src_open[j - 1] if j > 0 else 'unknown',
+                        'direction': int(np.sign(exposure[j])), 'entry_time': times[j - 1] if j > 0 else times[0],
+                        'entry_minute': int(mins[j - 1]) if j > 0 else 0, 'bars': int(k - j),
+                        'entry_price': float(closes[j - 1]) if j > 0 else float(closes[0]),
+                        'notional': float(shares * units * (closes[j - 1] if j > 0 else closes[0])),
+                        'gross': gross, 'cost': float(cost), 'net': gross - float(cost)})
+            j = k
+
     @staticmethod
     def _exposure_change_orders(exposure, close_prices) -> list:
         """Return ``(bar_index, exposure_delta, trade_price)`` executions.
@@ -3857,14 +3986,22 @@ class StrategyBacktester:
 
         for day_idx, trade_date in enumerate(trading_dates):
             daily_pnl = 0.0
+            # Audit fix 2026-10-01 (item 2): intraday positions are sized from the cash held at
+            # the start of the day; swing exits and entries at today's close come later in time.
+            capital_sod = capital
             day_ml_training_samples = []
             # Progress reporting
             if day_idx % 100 == 0:
                 pct = (day_idx / total_days) * 100
                 print(f"  Progress: {day_idx}/{total_days} days ({pct:.1f}%) - {trade_date}")
 
-            # VIX-based regime routing
-            vix_value = self.vix_data.get(trade_date, None)
+            # VIX-based regime routing on the PRIOR day's close: the trade date's
+            # close prints after every intraday entry. (Live gates on the current
+            # intraday VIX; there is no intraday VIX history to replay that.)
+            vix_value = self._prior_vix(trade_date)
+            intraday_vix = (getattr(self, 'vix_intraday', {}).get(trade_date)
+                            if getattr(self, 'vix_gate_mode', 'prior_close') == 'intraday' else None)
+            day_forced_open = False  # autocorr/HMM overrides open the ETF gate for the whole day
             # VIX filter only applies to ETFs, not stocks
             # Stocks trade regardless of VIX level (mean reversion works in all regimes)
             etf_vix_ok = True  # Default: ETFs can trade
@@ -3900,6 +4037,7 @@ class StrategyBacktester:
                             if market_autocorr >= -self.autocorr_threshold:
                                 # NOT mean-reverting - safe to trade low VIX days
                                 etf_vix_ok = True
+                                day_forced_open = True
                                 if day_idx % 50 == 0:
                                     print(f"    [AUTOCORR] Override: autocorr={market_autocorr:.3f} >= {-self.autocorr_threshold} (not mean-reverting)")
                             else:
@@ -3972,6 +4110,7 @@ class StrategyBacktester:
                                     # Only override if we're confident (high vol regime)
                                     if regime_name == 'HIGH_VOL':
                                         etf_vix_ok = True
+                                        day_forced_open = True
                                         if day_idx % 100 == 0:
                                             print(f"    [HMM] Override: {regime_name} -> INTRADAY despite VIX={vix_value:.1f}")
                                 elif hmm_action == 'CASH' and etf_vix_ok:
@@ -3987,6 +4126,13 @@ class StrategyBacktester:
                     in_danger_zone = True
                     etf_vix_ok = False  # No ETF intraday in danger zone
                     # Will also skip swing entries below
+
+            # Swing entries/exits are close-of-day decisions. With 1-min VIX they use the
+            # last print before the 16:00 equity close (the 15:59 bar), not the 16:15 close.
+            swing_vix, swing_etf_gate_open = vix_value, etf_vix_ok
+            if intraday_vix is not None:
+                swing_vix = self._vix_at(intraday_vix, pd.Timestamp.combine(trade_date, time(15, 59)))
+                swing_etf_gate_open = day_forced_open or self._etf_vix_gate_open(swing_vix, effective_vix_min)
 
             # ============================================================
             # SWING STRATEGY: Check exits and entries for low VIX regime
@@ -4007,7 +4153,7 @@ class StrategyBacktester:
                 # Check exit conditions
                 # VIX REGIME EXIT: ETFs exit swing when VIX crosses above threshold
                 is_etf = self.is_etf(symbol)
-                if is_etf and vix_value is not None and vix_value >= self.vix_min:
+                if is_etf and swing_vix is not None and swing_vix >= self.vix_min:
                     exit_reason = 'VIX_REGIME_CHANGE'
                 else:
                     exit_reason = self.check_swing_exit(symbol, trade_date, current_price)
@@ -4063,12 +4209,12 @@ class StrategyBacktester:
             # Swing entries (NOT in danger zone)
             # ETFs: only swing when VIX < 17 (when intraday is blocked)
             # Stocks: no VIX filter - always eligible for swing
-            if self.use_swing and vix_value is not None and not in_danger_zone:
+            if self.use_swing and swing_vix is not None and not in_danger_zone:
                 for symbol in self.symbols:
                     is_etf = self.is_etf(symbol)
 
                     # ETFs: only swing when VIX is LOW (intraday is blocked)
-                    if is_etf and etf_vix_ok:
+                    if is_etf and swing_etf_gate_open:
                         continue  # VIX >= 17, use intraday strategy for ETFs
 
                     # Stocks: no VIX filter - always eligible for swing
@@ -4077,9 +4223,9 @@ class StrategyBacktester:
                     if current_price is None:
                         continue
 
-                    if self.check_swing_entry(symbol, trade_date, current_price, vix=vix_value):
+                    if self.check_swing_entry(symbol, trade_date, current_price, vix=swing_vix):
                         # Calculate position size
-                        shares = self.calculate_swing_position_size(symbol, current_price, capital)
+                        shares = self.calculate_swing_position_size(symbol, current_price, capital, trade_date)
                         if shares <= 0:
                             continue
 
@@ -4122,7 +4268,7 @@ class StrategyBacktester:
                         autocorr = self.calculate_autocorrelation(symbol, trade_date) if self.swing_strict_mode else None
                         autocorr_str = f", autocorr: {autocorr:.2f}" if autocorr is not None else ""
                         print(f"    [SWING ENTRY] {symbol}: {shares} shares @ ${current_price:.2f}, "
-                              f"momentum: {momentum:.2%}, VIX: {vix_value:.1f}{autocorr_str}")
+                              f"momentum: {momentum:.2%}, VIX: {swing_vix:.1f}{autocorr_str}")
 
             # NOTE: No early exit here - stocks trade regardless of VIX
             # ETFs are filtered per-symbol below based on etf_vix_ok
@@ -4190,6 +4336,7 @@ class StrategyBacktester:
                 # Build exposure array for the day with TIME-VARYING SIGMA
                 # Paper: σ at time T = avg of |move from open by time T| over last 14 days
                 close_prices = day_bars['close'].values
+                bar_datetimes = day_bars['datetime'].values
                 minutes = day_bars['minutes_from_open'].values
                 vwap_prices = day_bars['vwap'].values
 
@@ -4198,6 +4345,8 @@ class StrategyBacktester:
                 upper_bounds = np.zeros(len(day_bars))
                 lower_bounds = np.zeros(len(day_bars))
                 commanded_position = 0  # Position implied by the last actionable trade bar
+                # Opt-in attribution: the candidate source that opened each position.
+                src_open = [None] * len(day_bars) if getattr(self, 'record_positions', False) else None
 
                 # ============================================================
                 # STRATEGY ROUTING: ETF (momentum) vs Stock (mean reversion/gap)
@@ -4206,7 +4355,7 @@ class StrategyBacktester:
 
                 # VIX filter only applies to ETFs - skip ETFs when VIX is unfavorable
                 # Stocks trade regardless of VIX (no VIX filter for stocks)
-                if is_etf_symbol and not etf_vix_ok:
+                if is_etf_symbol and not etf_vix_ok and intraday_vix is None:
                     continue
 
                 # For stocks, calculate volatility regime once per day
@@ -4214,10 +4363,12 @@ class StrategyBacktester:
                 if not is_etf_symbol and self.use_stock_vol_regime:
                     _, stock_vol_rank = self.calculate_stock_vol_regime(symbol, trade_date)
 
+                # Audit fix 2026-10-01 (item 3): compute every bar's noise bands before the
+                # signal pass, so candidate exits are simulated against real future bands
+                # (they were still zero). Bands use only information known before the day.
+                adj_sigma_arr = np.zeros(len(day_bars))
                 for bar_idx in range(len(day_bars)):
                     mins_from_open = minutes[bar_idx]
-                    is_trade_bar = mins_from_open >= 30 and mins_from_open % self.trade_freq == 0
-
                     # Get VIX-adaptive parameters if enabled
                     if self.use_vix_adaptive:
                         adaptive_lookback, adaptive_vm = self._get_adaptive_params(trade_date)
@@ -4324,6 +4475,13 @@ class StrategyBacktester:
                     # NOW CALCULATE BOUNDARIES using adjusted_sigma
                     upper_bounds[bar_idx] = anchor_high * (1 + adjusted_sigma)
                     lower_bounds[bar_idx] = anchor_low * (1 - adjusted_sigma)
+                    adj_sigma_arr[bar_idx] = adjusted_sigma
+
+                for bar_idx in range(len(day_bars)):
+                    mins_from_open = minutes[bar_idx]
+                    is_trade_bar = mins_from_open >= 30 and mins_from_open % self.trade_freq == 0
+
+                    adjusted_sigma = adj_sigma_arr[bar_idx]  # bands precomputed above
 
                     # ============================================================
                     # SIGNAL GENERATION: Route based on symbol type
@@ -4346,6 +4504,16 @@ class StrategyBacktester:
                         elif close_prices[bar_idx] < lower_bounds[bar_idx] and close_prices[bar_idx] < vwap_prices[bar_idx]:
                             base_signal = -1  # SHORT
                             candidate_source = 'etf_momentum'
+                        # Per-minute VIX gate (live reads the current VIX at every signal):
+                        # a new entry or reversal needs VIX >= vix_min at this minute; holds
+                        # and exits are never blocked, and a blocked reversal goes flat.
+                        if (intraday_vix is not None and not day_forced_open
+                                and base_signal != 0 and base_signal != commanded_position
+                                and not self._etf_vix_gate_open(
+                                    self._vix_at(intraday_vix, bar_datetimes[bar_idx]),
+                                    effective_vix_min)):
+                            base_signal = 0
+                            candidate_source = None
                     else:
                         # STOCK STRATEGY: Mean reversion or gap capture
                         if self.stock_strategy_mode in ['mean_reversion', 'hybrid', 'vol_adaptive']:
@@ -4536,6 +4704,10 @@ class StrategyBacktester:
                         else:
                             self.ml_gate_stats['feature_passthrough'] += 1
 
+                    if (src_open is not None and is_trade_bar and final_signal != 0
+                            and final_signal != commanded_position):
+                        src_open[bar_idx] = candidate_source or 'unknown'
+
                     if is_trade_bar:
                         commanded_position = final_signal
 
@@ -4596,7 +4768,7 @@ class StrategyBacktester:
                 rsi_mult = self._rsi_gamma_multiplier(rsi_prev)
 
                 # Position size based on day's open price (paper spec)
-                shares = int((capital * self.allocations[symbol]) / open_prices[symbol] * vol_scalar * rsi_mult)
+                shares = int((capital_sod * self.allocations[symbol]) / open_prices[symbol] * vol_scalar * rsi_mult)
                 
                 if shares > 0:
                     # Calculate minute-by-minute price changes
@@ -4647,6 +4819,9 @@ class StrategyBacktester:
                     gross_pnl = np.sum(minute_pnl)
                     net_pnl = gross_pnl - total_transaction_cost
                     daily_pnl += net_pnl
+                    if src_open is not None:
+                        self._log_positions(symbol, trade_date, day_bars, exposure, minute_pnl,
+                                            execution_orders, execution_estimates, src_open, shares)
 
                     # Record trades for reporting
                     if trades_count > 0:
@@ -4816,6 +4991,15 @@ class StrategyBacktester:
                         )
                         final_swing_proceeds += proceeds
                         final_liquidation_cost += exit_cost
+                        # Audit fix 2026-10-01 (item 6): record terminal exits like any other.
+                        self.swing_trades.append({
+                            'type': 'SWING', 'symbol': sym, 'entry_date': pos['entry_date'],
+                            'entry_price': entry_price, 'exit_date': trading_dates[-1],
+                            'exit_price': exit_price, 'exit_reason': 'BACKTEST_END', 'shares': shares,
+                            'pnl': pnl, 'return': (exit_price / entry_price) - 1,
+                            'entry_transaction_cost': entry_cost, 'exit_transaction_cost': exit_cost,
+                            'transaction_cost': entry_cost + exit_cost,
+                        })
                         print(f"    - {sym}: {shares} shares @ ${exit_price:.2f} (entry: ${entry_price:.2f}), PnL: ${pnl:,.2f}")
 
             # Add liquidation proceeds to capital
@@ -4834,6 +5018,9 @@ class StrategyBacktester:
         # Calculate returns only after final liquidation has been reflected in
         # the curve; otherwise the final execution fee is omitted from metrics.
         daily_returns_list = []
+        # Audit fix 2026-10-01 (item 5): the first day's return is measured from initial capital.
+        if equity_curve and self.initial_capital > 0:
+            daily_returns_list.append(equity_curve[0]['portfolio_value'] / self.initial_capital - 1)
         for i in range(1, len(equity_curve)):
             prev_val = equity_curve[i-1]['portfolio_value']
             curr_val = equity_curve[i]['portfolio_value']

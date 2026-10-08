@@ -171,7 +171,12 @@ class EarningsParser:
         *,
         model_id: str,
         parser_version: str = PARSER_VERSION,
+        clock: Callable[[], dt.datetime] | None = None,
     ):
+        # assessed_at is when the assessment really became known, which is
+        # what keeps state_at point-in-time; it must not be back-dated to
+        # available_at. The clock is injectable for tests and replays.
+        self.clock = clock or (lambda: dt.datetime.now(EASTERN))
         self.engine = engine
         self.extractor = extractor
         self.model_id = str(model_id)
@@ -186,7 +191,7 @@ class EarningsParser:
             "symbol": item.symbol,
             "document_type": item.document_type,
             "available_at": item.available_at,
-            "assessed_at": dt.datetime.now(EASTERN),
+            "assessed_at": self.clock(),
             "direction": result["direction"],
             "confidence": result["confidence"],
             # Market confirmation is deliberately supplied by a separate

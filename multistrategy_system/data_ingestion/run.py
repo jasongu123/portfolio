@@ -13,7 +13,7 @@ from typing import Iterable
 
 from .alpha_vantage import AlphaVantageCollector
 from .macro import DEFAULT_FRED_SERIES, TREASURY_DATASETS, MacroCollector
-from .storage import DataStore
+from .storage import DataStore, default_data_root
 
 
 DEFAULT_EQUITY_SYMBOLS = (
@@ -105,8 +105,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--root",
-        default=os.environ.get("RESEARCH_DATA_ROOT", "data_lake"),
-        help="raw/SQLite data root (default: data_lake)",
+        default=default_data_root(),
+        help="raw/SQLite data root (default: <project>/data_lake)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -194,5 +194,94 @@ class NewsJournalTests(unittest.TestCase):
             self.assertEqual(row["price_0930"], 102.0)
 
 
-if __name__ == "__main__":
+
+
+class SchemaConstraintTests(unittest.TestCase):
+    def test_schema_has_no_keywords_structured_outputs_reject(self):
+        from news_analyzer import NEWS_ASSESSMENT_SCHEMA
+        banned = {'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum', 'multipleOf',
+                  'minLength', 'maxLength', 'minItems', 'maxItems'}
+
+        def walk(node):
+            if isinstance(node, dict):
+                self.assertFalse(banned & set(node), node)
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(NEWS_ASSESSMENT_SCHEMA)
+
+
+
+class ModelRequestParamsTests(unittest.TestCase):
+    def test_haiku_4_5_unchanged(self):
+        from news_analyzer import model_request_params
+        p = model_request_params("claude-haiku-4-5-20251001")
+        self.assertEqual((p["temperature"], p["max_tokens"]), (0, 500))
+        self.assertNotIn("thinking", p)
+
+    def test_sonnet_5_5_has_no_temperature_and_thinking_off(self):
+        from news_analyzer import model_request_params
+        p = model_request_params("claude-sonnet-5-5")
+        self.assertNotIn("temperature", p)
+        self.assertEqual(p["thinking"], {"type": "between_tools"})
+        self.assertIn("format", p["output_config"])
+
+    def test_opus_5_5_low_effort_and_unknown_models_safe(self):
+        from news_analyzer import model_request_params
+        p = model_request_params("claude-opus-5-5")
+        self.assertEqual(p["output_config"]["effort"], "low")
+        self.assertNotIn("temperature", p)
+        q = model_request_params("claude-haiku-5-5")
+        self.assertNotIn("temperature", q)
+        self.assertNotIn("thinking", q)
+        self.assertEqual(q["max_tokens"], 4000)
+
+    def test_sonnet_5_5_end_to_end_with_a_thinking_block_first(self):
+        """The analyzer sends Sonnet 5.5 settings and reads the text block after a thinking block."""
+        class ThinkingFirst(FakeMessages):
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    stop_reason="end_turn",
+                    content=[SimpleNamespace(type="thinking", thinking=""),
+                             SimpleNamespace(type="text", text=json.dumps(self.result))],
+                    usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+
+        with tempfile.TemporaryDirectory() as folder:
+            store = DataStore(folder)
+            fake = FakeAnthropic(VALID_ASSESSMENT)
+            fake.messages = ThinkingFirst(VALID_ASSESSMENT)
+            analyzer = NewsAnalyzer(ibkr_client=FakeIBKR(), anthropic_client=fake, store=store,
+                                    model="claude-sonnet-5-5")
+            now = dt.datetime(2026, 7, 13, 7, 0, tzinfo=ZoneInfo("America/New_York"))
+            res = analyzer.analyze_premarket_sentiment("AAPL", market_context={}, now=now)
+        self.assertEqual(res["_status"], "success")
+        call = fake.messages.calls[0]
+        self.assertNotIn("temperature", call)
+        self.assertEqual(call["thinking"], {"type": "between_tools"})
+
+
+class DataRootTests(unittest.TestCase):
+    def test_default_root_is_the_project_folder_not_the_working_directory(self):
+        import os
+        from unittest import mock
+        from data_ingestion import storage
+        project = os.path.dirname(os.path.dirname(os.path.abspath(storage.__file__)))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RESEARCH_DATA_ROOT", None)
+            here = os.getcwd()
+            with tempfile.TemporaryDirectory() as elsewhere:
+                os.chdir(elsewhere)                          # e.g. started from VS Code's folder
+                try:
+                    self.assertEqual(storage.default_data_root(), os.path.join(project, "data_lake"))
+                finally:
+                    os.chdir(here)                           # leave before the folder is deleted (Windows
+                                                             # cannot delete the current directory)
+        with mock.patch.dict(os.environ, {"RESEARCH_DATA_ROOT": "/tmp/custom_root"}):
+            self.assertEqual(storage.default_data_root(), "/tmp/custom_root")
+
+
+if __name__ == '__main__':
     unittest.main()

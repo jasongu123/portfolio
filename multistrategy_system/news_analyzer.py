@@ -47,6 +47,9 @@ except ImportError:
     HAS_REQUESTS = False
 
 
+# Structured outputs reject numerical and string constraints (minimum, maximum, multipleOf,
+# minLength, maxLength) with a 400; ranges are stated in descriptions and enforced by
+# _validate_result. (2026-10-01: every call had failed with "For 'integer' type, ...".)
 NEWS_ASSESSMENT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -63,7 +66,7 @@ NEWS_ASSESSMENT_SCHEMA = {
             "type": "string",
             "enum": ["bullish", "bearish", "mixed", "neutral"],
         },
-        "severity": {"type": "integer", "minimum": 0, "maximum": 3},
+        "severity": {"type": "integer", "description": "0 = immaterial .. 3 = major; an integer from 0 to 3"},
         "horizon": {
             "type": "string",
             "enum": ["opening", "intraday", "multiday", "unclear"],
@@ -72,8 +75,8 @@ NEWS_ASSESSMENT_SCHEMA = {
             "type": "string",
             "enum": ["new", "update", "repeat", "unclear"],
         },
-        "relevance": {"type": "number", "minimum": 0, "maximum": 1},
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "relevance": {"type": "number", "description": "0 to 1"},
+        "confidence": {"type": "number", "description": "0 to 1"},
         "headline": {"type": "string"},
         "catalyst": {"type": "string"},
         "surprise_summary": {"type": "string"},
@@ -96,6 +99,38 @@ comparison or expectation. Separate company-specific events from sector and broa
 market stories. Return the requested structured assessment only."""
 
 EASTERN = ZoneInfo("America/New_York")
+
+
+# Model families whose API still accepts temperature (newer models reject non-default sampling
+# with a 400, e.g. Claude Sonnet 5.5, Opus 4.7 and later).
+_SAMPLING_OK = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-sonnet-4-6", "claude-opus-4-6",
+                "claude-opus-4-5", "claude-3")
+
+
+def model_request_params(model: str) -> dict:
+    """Request settings for one structured-output news assessment, per model (2026-10-02).
+
+    - Haiku 4.5 and other older models: temperature 0, no thinking, 500 output tokens (unchanged).
+    - Claude Sonnet 5.5: thinking off via {"type": "between_tools"} (it rejects "disabled" and
+      non-default temperature).
+    - Claude Sonnet 5: thinking {"type": "disabled"}.
+    - Claude Opus 5 / 5.5 and Fable: thinking cannot be switched off; effort "low".
+    - Anything else (e.g. a future Haiku): no temperature and no thinking setting (the model's
+      defaults), with room for any default thinking in a larger output budget.
+    Every newer model gets 4,000 output tokens so default thinking cannot cut the answer short.
+    """
+    fmt = {"format": {"type": "json_schema", "schema": NEWS_ASSESSMENT_SCHEMA}}
+    m = str(model)
+    if m.startswith(_SAMPLING_OK):
+        return {"model": m, "max_tokens": 500, "temperature": 0, "output_config": fmt}
+    params = {"model": m, "max_tokens": 4000, "output_config": dict(fmt)}
+    if m.startswith("claude-sonnet-5-5"):
+        params["thinking"] = {"type": "between_tools"}
+    elif m.startswith("claude-sonnet-5"):
+        params["thinking"] = {"type": "disabled"}
+    elif m.startswith(("claude-opus-5", "claude-fable", "claude-mythos")):
+        params["output_config"]["effort"] = "low"
+    return params
 
 
 class NewsAnalyzer:
@@ -135,7 +170,7 @@ class NewsAnalyzer:
             "ANTHROPIC_NEWS_MODEL", "claude-haiku-4-5-20251001"
         )
         self.prompt_version = "premarket_event_v2"
-        self.store = store or DataStore(os.environ.get("RESEARCH_DATA_ROOT", "data_lake"))
+        self.store = store or DataStore()  # <project>/data_lake unless RESEARCH_DATA_ROOT is set
 
         if not use_local:
             if not HAS_ANTHROPIC:
@@ -404,16 +439,11 @@ class NewsAnalyzer:
         return [self._event_text(event) for event in events]
 
     def _call_claude(self, payload: dict):
-        """Call Claude with schema-constrained output."""
+        """Call Claude with schema-constrained output, using request settings the model accepts."""
         response = self.client.messages.create(
-            model=self.model,
-            max_tokens=500,
-            temperature=0,
             system=SYSTEM_PROMPT,
-            output_config={
-                "format": {"type": "json_schema", "schema": NEWS_ASSESSMENT_SCHEMA}
-            },
             messages=[{"role": "user", "content": json.dumps(payload, sort_keys=True)}],
+            **model_request_params(self.model),
         )
         return response
 
@@ -589,7 +619,9 @@ class NewsAnalyzer:
                 response = self._call_claude(payload)
                 if getattr(response, "stop_reason", None) not in {"end_turn", "stop_sequence"}:
                     raise ValueError(f"unexpected Claude stop reason: {response.stop_reason}")
-                raw_response = response.content[0].text
+                raw_response = next(
+                    (b.text for b in response.content if getattr(b, "type", "text") == "text"), ""
+                )
                 usage = getattr(response, "usage", None)
                 input_tokens = getattr(usage, "input_tokens", None)
                 output_tokens = getattr(usage, "output_tokens", None)

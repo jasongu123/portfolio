@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -10,11 +11,21 @@ import sqlite3
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def default_data_root() -> str:
+    """RESEARCH_DATA_ROOT if set, else <project folder>/data_lake, whatever the working directory.
+
+    Before 2026-10-02 the default was the relative path "data_lake", so a run started from another
+    folder (VS Code's Run button starts in VS Code's own folder) wrote a second, separate database.
+    """
+    project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.environ.get("RESEARCH_DATA_ROOT") or os.path.join(project, "data_lake")
 
 
 class DataStore:
@@ -25,7 +36,8 @@ class DataStore:
     rebuilt from the raw layer.
     """
 
-    def __init__(self, root: str | os.PathLike[str] = "data_lake"):
+    def __init__(self, root: str | os.PathLike[str] | None = None):
+        root = default_data_root() if root is None else root
         self.root = Path(root).expanduser().resolve()
         self.raw_root = self.root / "raw"
         self.db_path = self.root / "research.sqlite3"
@@ -33,13 +45,21 @@ class DataStore:
         self._lock = threading.RLock()
         self._initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection for one unit of work: commit on success, roll back
+        on error, and always close. sqlite3's own ``with conn:`` only commits;
+        the unclosed handle keeps the file locked on Windows."""
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _initialize(self) -> None:
         with self.connect() as conn:
@@ -208,6 +228,29 @@ class DataStore:
 
                 CREATE INDEX IF NOT EXISTS idx_premarket_decisions_symbol_time
                     ON premarket_news_decisions(symbol, decided_at);
+
+                CREATE TABLE IF NOT EXISTS core_news_shadow (
+                    shadow_id TEXT PRIMARY KEY,
+                    assessment_id TEXT,
+                    symbol TEXT NOT NULL,
+                    signal TEXT NOT NULL,
+                    signal_at TEXT NOT NULL,
+                    reference_price REAL,
+                    would_block INTEGER NOT NULL,
+                    block_reason TEXT,
+                    score REAL,
+                    impact TEXT,
+                    assessment_status TEXT,
+                    price_30m REAL,
+                    return_30m REAL,
+                    price_60m REAL,
+                    return_60m REAL,
+                    price_close REAL,
+                    return_close REAL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_core_news_shadow_symbol_time
+                    ON core_news_shadow(symbol, signal_at);
                 """
             )
 
@@ -443,6 +486,52 @@ class DataStore:
                 )
                 """,
                 payload,
+            )
+
+    def record_core_news_shadow(self, row: dict[str, Any]) -> None:
+        defaults = {
+            "assessment_id": None,
+            "reference_price": None,
+            "block_reason": None,
+            "score": None,
+            "impact": None,
+            "assessment_status": None,
+        }
+        payload = {**defaults, **row}
+        payload["would_block"] = 1 if payload.get("would_block") else 0
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO core_news_shadow (
+                    shadow_id, assessment_id, symbol, signal, signal_at,
+                    reference_price, would_block, block_reason, score, impact,
+                    assessment_status
+                ) VALUES (
+                    :shadow_id, :assessment_id, :symbol, :signal, :signal_at,
+                    :reference_price, :would_block, :block_reason, :score, :impact,
+                    :assessment_status
+                )
+                """,
+                payload,
+            )
+
+    def update_core_news_shadow(self, shadow_id: str, **updates: Any) -> None:
+        allowed = {
+            "price_30m",
+            "return_30m",
+            "price_60m",
+            "return_60m",
+            "price_close",
+            "return_close",
+        }
+        payload = {key: value for key, value in updates.items() if key in allowed}
+        if not payload:
+            return
+        assignments = ", ".join(f"{key}=?" for key in payload)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE core_news_shadow SET {assignments} WHERE shadow_id=?",
+                [*payload.values(), shadow_id],
             )
 
     def update_premarket_decision(self, decision_id: str, **updates: Any) -> None:

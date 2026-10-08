@@ -14,6 +14,7 @@ preferred.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -21,7 +22,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 from zoneinfo import ZoneInfo
 
 
@@ -217,11 +218,17 @@ class EarningsEventStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def connect(self):
+    @contextlib.contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Commit on success, roll back on error, always close (see DataStore)."""
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self):
         with self.connect() as conn:

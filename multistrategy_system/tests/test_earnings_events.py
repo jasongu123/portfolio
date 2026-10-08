@@ -203,7 +203,12 @@ class EarningsEngineTests(unittest.TestCase):
                 "contradictions": [],
             }
 
-        parser = EarningsParser(engine, extractor, model_id="test-model")
+        parser = EarningsParser(
+            engine,
+            extractor,
+            model_id="test-model",
+            clock=lambda: dt.datetime(2026, 8, 4, 16, 6, tzinfo=ET),
+        )
         assessment = parser.parse(
             ParserInput(
                 event_id=event.event_id,
