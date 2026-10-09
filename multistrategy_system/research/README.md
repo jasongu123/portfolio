@@ -1,10 +1,10 @@
 # Systematic Trading Research on Interactive Brokers — Project Summary
 
-*As of 7 October 2026 (numbers corrected after an external code audit). Paper trading only.*
+*As of 9 October 2026 (numbers corrected after an external code audit). Paper trading only.*
 
 ## 1. In one paragraph
 
-Since mid-2026 I have built and run a multi-strategy systematic trading system on Interactive Brokers (paper account), deployed on a Windows cloud VM, together with a research program that tests every idea under rules fixed in advance. The system trades a cross-asset trend-following sleeve, an intraday ETF momentum sleeve based on a published paper, and a stock swing book, plus two paper candidates. The research record holds **97 pre-registered trials**, each logged with its pass/fail rule before any result was seen. Most ideas failed, and each failure is written up with its likely cause. The most important results were diagnostic: taking my own engine apart showed where its profit really came from, and a faithful replication of the source paper showed that my own modifications had turned a working strategy into a losing one. The latest project taught a small free model to read earnings press releases the way a large language model does: it learned to label them as well as Claude Haiku, and its labels identified real price-moving news, but that news was fully priced within a day.
+Since mid-2026 I have built and run a multi-strategy systematic trading system on Interactive Brokers (paper account), deployed on a Windows cloud VM, together with a research program that tests every idea under rules fixed in advance. The system trades a cross-asset trend-following sleeve, an intraday ETF momentum sleeve based on a published paper, and a stock swing book, plus two paper candidates. The research record holds **97 pre-registered trials**, each logged with its pass/fail rule before any result was seen. Most ideas failed, and each failure is written up with its likely cause. The most important results were diagnostic: taking my own engine apart showed where its profit really came from, and a faithful replication of the source paper showed that my own modifications had turned a working strategy into a losing one. After the research, the live system was restructured to its three working parts; that book backtests at a Sharpe of 1.70 (0.98 after a 5% cash rate) with a −5.8% maximum drawdown over 2020–2025, in-sample for the restructure decisions and now under live forward test. The latest project taught a small free model to read earnings press releases the way a large language model does: it learned to label them as well as Claude Haiku, and its labels identified real price-moving news, but that news was fully priced within a day.
 
 ## 2. What runs live (paper)
 
@@ -12,7 +12,7 @@ Since mid-2026 I have built and run a multi-strategy systematic trading system o
 |---|---|---|
 | Cross-asset trend | Time-series momentum on 16 ETFs (equities, Treasuries, commodities, currencies, real estate), 3/6/12-month signal ensemble, rebalanced monthly at month-end | Validated |
 | ETF intraday momentum | SPY, QQQ, IWM on the rules of Zarattini, Aziz & Barbon (2024), "Beat the Market": a trade when price leaves its normal intraday range (the 14-day average move from the open), decisions every 30 minutes, trailing stop at the range or VWAP, flat by the close, size targeting 2% daily volatility with a 4× cap | Forward paper test from Oct 2026 |
-| Stock swing book | 21 large-cap stocks; multi-day long positions on momentum with ATR trailing stops | Running; under review (see 5.3) |
+| Stock swing book | 21 large-cap stocks; multi-day long positions on momentum with ATR trailing stops | Running; treated as risk-managed market exposure, not alpha (see 5.3) |
 | RFS (VOO) and intramonth sector rotation | Paper candidates from earlier research | Candidates only |
 | Premarket news | An LLM (Claude) classifies overnight news per stock (event type, direction, severity, novelty); half-size paper trades on high-conviction events | Collecting data |
 
@@ -36,14 +36,33 @@ Since mid-2026 I have built and run a multi-strategy systematic trading system o
 - **Multiple-testing awareness.** Deflated Sharpe ratio on the headline, with the trial count tracked.
 - **Conventions kept separate.** Sharpe both with a 5% cash rate subtracted ("rf") and without it ("no-rf"), never mixed. Drawdown is measured from initial capital.
 
-## 4. Headline numbers (backtest, 2020–2025)
+## 4. Headline numbers (backtest, 2 Jan 2020 to 15 Dec 2025)
 
-| | Sharpe, rf | Sharpe, no-rf | Max drawdown |
-|---|---|---|---|
-| Combined book (original 12-stock engine + trend, walk-forward inverse-vol weights) | 0.44 | 1.04 | −8.2% |
-| Trend sleeve alone | 0.42 | 0.83 | −22.2% |
+| | Sharpe, rf | Sharpe, no-rf | Max drawdown | Return a year |
+|---|---|---|---|---|
+| **Restructured book: trend + ETF momentum (paper rules) + stock swing book**, walk-forward inverse-vol weights | **0.98** | **1.70** | **−5.8%** | +12.2% |
+| Old book (original engine + trend), same method and window | 0.44 | 1.04 | −8.2% | +8.7% |
+| Trend sleeve alone | 0.41 | 0.81 | −22.2% | +9.7% |
+| ETF momentum alone (paper rules) | 0.42 | 0.81 | −15.5% | +9.9% |
+| Stock swing book alone | 0.79 | 1.19 | −13.1% | +15.0% |
 
-The book beats both of its components on Sharpe and drawdown (equity sleeve alone 0.24 / 0.72, −20.2%), because the two sleeves are nearly uncorrelated; it was positive in 5 of 6 years (2022: −0.40). These figures are after the audit fixes in 5.11; before them the book read 0.51 / 1.13. **Caveat:** the equity side is mostly market exposure (5.3), and the live engine has since been restructured, so this headline describes the pre-restructure system.
+**Why the book beats every sleeve.** The three sleeves barely move together: daily correlations
+are −0.12, −0.02 and +0.01. The walk-forward weights average about one third each, so one sleeve's
+bad stretch is mostly offset by the others. Every year was positive on rf Sharpe; 2025 was the
+weakest (+0.04). The last 24 months came in at 1.50 no-rf.
+
+**Limits on this headline:**
+- **Not out of sample.** The restructure was chosen using these same years: dropping mean reversion
+  and adopting the paper's ETF rules came from the split test (5.4, 5.5). The ETF rules were
+  published in 2024 and not tuned here, but the decision to use them came after seeing this data.
+  The live forward tests are the real check; expect them to be weaker.
+- **The ETF sleeve is cost-sensitive.** These figures assume 0.5 bp a side, and its Sharpe roughly
+  halves at 1 bp.
+- **The stock list carries hindsight** (5.3).
+- **The swing book adds nothing at book level.** Replacing it with an equal-weight basket of the same
+  stocks gives the same book (1.71 no-rf).
+
+All figures are after the audit fixes in 5.11; before them the old book read 0.51 / 1.13.
 
 ## 5. Key findings
 
@@ -240,6 +259,7 @@ An earlier version traded 12 related large-cap pairs and failed when one relatio
 - Stock mean reversion, gap trades and an untested first-30-minute strategy were switched off.
 - The ML gate and its multi-hour startup training were switched off.
 - Every change is behind a switch, so it can be undone without code changes.
+- The result is three nearly uncorrelated sleeves: trend, ETF momentum on the paper's rules, and the stock swing book (section 4).
 
 ## 7. Honest limitations
 - **Paper trading only.** IBKR declined futures permission, so the system uses ETFs instead.

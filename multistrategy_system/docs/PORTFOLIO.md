@@ -1,6 +1,6 @@
 # Portfolio overview
 
-*Updated 8 October 2026. This replaces the September 2026 version, which described an older
+*Updated 9 October 2026. This replaces the September 2026 version, which described an older
 configuration (intraday mean reversion with an ML gate) and pre-audit numbers. The full research
 record is in [`../research/README.md`](../research/README.md).*
 
@@ -17,16 +17,19 @@ Removed after research:
 - gap trades, which never fired;
 - the ML trade gate, whose whole value was shrinking the losses of the removed strategies.
 
-## Headline backtest (2020–2025)
+## Headline backtest (2 Jan 2020 to 15 Dec 2025)
 
 | | Sharpe, rf | Sharpe, no-rf | Max drawdown |
 |---|---|---|---|
-| Combined book (equity engine + trend, walk-forward inverse-volatility weights) | 0.44 | 1.04 | −8.2% |
-| Trend sleeve alone | 0.42 | 0.83 | −22.2% |
+| Restructured book: trend + ETF momentum (paper rules) + stock swing book, walk-forward inverse-volatility weights | 0.98 | 1.70 | −5.8% |
+| Old book (original engine + trend), same method and window | 0.44 | 1.04 | −8.2% |
+| Trend sleeve alone | 0.41 | 0.81 | −22.2% |
 
-These figures are after an external code audit, which cut the book from 1.13 to 1.04 no-rf. They
-describe the engine before the October 2026 restructure; a rebuild with the three live sleeves is
-pending. "rf" subtracts a 5% cash rate; "no-rf" does not. The two are never mixed.
+The three sleeves barely move together (daily correlations −0.12 to +0.01), and every year was
+positive. The figures are in-sample: the restructure was chosen on these same years, so the live
+forward tests are the real check. The ETF sleeve assumes 0.5 bp a side and is cost-sensitive. "rf"
+subtracts a 5% cash rate; "no-rf" does not; the two are never mixed. Details are in
+[`../research/writeups/HEADLINE_RESTRUCTURED.md`](../research/writeups/HEADLINE_RESTRUCTURED.md).
 
 ## What the research found
 
