@@ -68,9 +68,28 @@ THIN_BPS = 5.0
 SUBS = (('2008-2013', '2008-01-01', '2013-12-31'), ('2014-2019', '2014-01-01', '2019-12-31'), ('2020-2026', '2020-01-01', None))
 
 
+def matched_prices(prices, cols):
+    """Audit finding 12 (2026-10-11): every instrument ends on the last date ALL of them have a real
+    price (no zero returns for instruments whose data stopped earlier), and an interior missing price
+    carries the previous mark, so the move across a gap is booked when trading resumes instead of
+    being dropped. Returns the matched frame and the common end date."""
+    end = min(prices[c].last_valid_index() for c in cols)
+    p = prices.loc[:end].copy()
+    p[cols] = p[cols].ffill()
+    return p, end
+
+
+def check_marks(normalized, rets):
+    """Refuse to run if any held position lacks a return (a missing mark)."""
+    bad = normalized.ne(0) & rets.reindex(normalized.index)[normalized.columns].isna()
+    if bad.values.any():
+        raise ValueError(f"{int(bad.values.sum())} held position-days have no price: {bad.sum()[bad.sum() > 0].to_dict()}")
+
+
 def run(prices, universe, thin_bps=THIN_BPS):
     """V1_trail rule on `universe`; returns net port series (with attrs) and per-asset contributions."""
     normalized, px, rets, _, month_ends = v3.build_weights(prices, universe, 'V2', t2.HORIZONS, legacy=False)
+    check_marks(normalized, rets)
     port = v3.scale_and_cost(normalized, px, rets, scalar_mode='trailing', month_ends=month_ends)
     # reconstruct the daily scalar to get target weights and contributions (same recipe as rates_attribution)
     gross = (normalized * rets).sum(axis=1)
@@ -121,6 +140,8 @@ def main():
     prices = prices.sort_index()
     live16 = [c for c in v3.LIVE16 if c in prices.columns]
     adds = [c for b in BLOCKS.values() for c in b if c in prices.columns]
+    prices, common_end = matched_prices(prices, live16 + adds)
+    print(f"Matched data: every instrument ends {common_end.date()}; interior gaps carry the last mark")
     missing = [c for b in BLOCKS.values() for c in b if c not in prices.columns]
     spy = prices['SPY'].pct_change(fill_method=None)
     print(f"Base {len(live16)}; additions present {len(adds)}, missing {missing}")

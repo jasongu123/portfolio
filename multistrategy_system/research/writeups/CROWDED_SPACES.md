@@ -88,3 +88,5 @@ Per anomaly, the crowding filter made every one worse than its unfiltered legs: 
 
 Not a candidate. The 13F pipeline, the CUSIP map and the holdings file are reusable. Registry at
 37 trials, two survivors.
+
+> **Audit fix 2026-10-11 (finding 11).** Holdings now count only 13F filings published before the date each quarter is first used. 8,246 late manager filings (0.01% of shares) were removed. The rerun is identical to the decimal (CS −0.59, ALL −0.35, mirror +0.44), so the verdict stands on point-in-time data.

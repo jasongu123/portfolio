@@ -245,13 +245,15 @@ An earlier version traded 12 related large-cap pairs and failed when one relatio
 - **Same-day VIX look-ahead.** The backtester used the day's VIX close for intraday decisions. Corrected to per-minute VIX; the headline fell from 0.54 to 0.51 rf.
 - **Stock-split detection.** It missed TSLA's 2020 split and invented a WFC split. Fixed by pinning splits to short-interest settlement data.
 - **Training window before the data existed.** The live model trained on a window starting before the VIX data began. Fixed by moving to a calendar-based window, plus a data-coverage check that refuses to train on incomplete data.
-- **An external code audit (October 2026)** found ten implementation defects in the backtester and research scripts. Examples:
+- **An external code audit (October 2026)** found twelve implementation defects in the backtester and research scripts. Examples:
   - swing positions sized with volatility from years later;
   - a close-of-day trade changing the same morning's position size;
   - training labels simulated against price bands that had not been computed yet;
-  - each yearly run starting without its history.
+  - each yearly run starting without its history;
+  - fund holdings (13F) used a few days before some filings were public;
+  - missing prices silently counted as zero returns.
 
-  I reproduced every finding, fixed each with a regression test that fails on the old code, and reran everything affected without changing any strategy rule. Every pre-registered decision held. The headline book fell from 1.13 to 1.04 no-rf.
+  I reproduced every finding and fixed all twelve, with regression tests that fail on the old code wherever the defect was in code rather than in a run's settings. I reran the results behind every current decision without changing any strategy rule. Every pre-registered decision held, and the headline book fell from 1.13 to 1.04 no-rf. The last two fixes were in older studies that had already failed, and their reruns left those verdicts unchanged. The older ML-gate comparisons are marked superseded rather than rerun, since the gate is off.
 - **The news pipeline never worked.** Every LLM call was rejected because the output schema used range constraints the API does not support. Found it with a diagnostic probe and fixed it.
 
 ## 6. What changed live because of the research (October 2026)

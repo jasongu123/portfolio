@@ -107,3 +107,5 @@ which is the kind of observation the registry records and does not act on. ETF-w
 is closed as a route: two constructions, ten criteria, ten failures, and the direction of the
 failure is recent. If futures ever become available the hypothesis is worth re-opening on
 futures data, where the wrapper costs that drive this result do not exist.
+
+> **Audit fix 2026-10-11 (finding 12).** The base ETFs' data ended on 2026-06-24 while the additions ran to September, and missing prices were booked as zero returns. All series now end on 2026-06-24 and interior gaps carry the last mark (77 held position-days had been affected, mostly CPER). Rerun: BASE16 rf 0.19 (was 0.18), BREADTH46 −0.04 (was −0.05), SB42 0.06 (was 0.05). Verdicts unchanged.

@@ -18,8 +18,8 @@ These are corrections, not trials: no strategy rule was changed in response to a
 | 8 | ML x-section compounded P&L increments as returns | Fixed: NAV-based returns (`tests/test_ml_xsection_accounting.py`) |
 | 9 | ML x-section dropped the last open month | Fixed: held and marked to the data's end |
 | 10 | Daily vol window ended the day before yesterday | Fixed |
-| 11 | 13F publication look-ahead (crowded spaces) | Open; the study failed despite the bias, so a rerun can only weaken it further |
-| 12 | Trend breadth: missing marks treated as zero | Open; affects the older breadth study's recent window |
+| 11 | 13F publication look-ahead (crowded spaces) | Fixed 2026-10-11: each quarter's aggregate uses only filings published before its first use (`parse_13f.point_in_time`; 8,246 late manager filings, 0.01% of shares, removed). Rerun: CS −0.59, ALL −0.35, mirror +0.44, unchanged; daily returns identical. Test: `tests/test_audit_open_items.py` |
+| 12 | Trend breadth: missing marks treated as zero | Fixed 2026-10-11: all instruments end on the common last real price (2026-06-24), interior gaps carry the last mark, and a held position without a price stops the run (`trend_breadth.matched_prices`, `check_marks`). Rerun: BASE16 0.19 → BREADTH46 −0.04 rf (was 0.18 → −0.05); SB42 0.06 (was 0.05); verdicts unchanged. The same interior-gap fix moves the live 16-ETF trend sleeve by 0.001 Sharpe. Tests: `tests/test_audit_open_items.py` |
 | — | Gate trials (GATE_TRIAL, PERGATE_TRIAL) | Not rerun yet (the gate is off live); figures superseded |
 | — | Vol forecast years grouped by forecast origin | By design; noted in VOL_FORECAST.md |
 
